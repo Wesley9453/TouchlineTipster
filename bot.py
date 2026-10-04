@@ -8,7 +8,7 @@ import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-VERSION = "3.7"
+VERSION = "3.8"
 API_BASE = "https://openfootapi.com/v1"
 SEASON = os.getenv("OPENFOOT_SEASON", "2026/27")
 SAMPLE_SIZE = 5
@@ -162,7 +162,22 @@ def model(h,a):
             "adnb":p(lambda x,y:x<y)/(max(p(lambda x,y:x>y)+p(lambda x,y:x<y),.0001)),
             "hp1":p(lambda x,y:x+1>y),"ap1":p(lambda x,y:y+1>x),"hm1":p(lambda x,y:x-1>y),"am1":p(lambda x,y:y-1>x)}
 
-def cap(v): return max(0,min(MAX_CONFIDENCE,round(v*100)))
+def conservative_confidence(probability, sample_sizes):
+    """Convert model probability into deliberately conservative confidence.
+
+    v3.8 avoids treating raw probabilities as confidence. A 90% raw model
+    probability does not become 90% confidence; the transformation also
+    accounts for the small-sample problem and keeps 72% as an absolute cap.
+    """
+    p = max(0.0, min(1.0, probability))
+    base = 50.0 + ((p - 0.50) * 55.0)
+
+    # Five-match samples are still small. Reduce confidence when fewer
+    # completed matches are available on either side.
+    n = min(sample_sizes) if sample_sizes else SAMPLE_SIZE
+    reliability_penalty = max(0.0, 5.0 - float(n)) * 2.0
+
+    return max(0, min(MAX_CONFIDENCE, round(base - reliability_penalty)))
 
 def markets(h,a,m):
     def blend(x,*e): return .65*x+.35*(sum(e)/len(e))
@@ -178,7 +193,17 @@ def markets(h,a,m):
          ("Home DNB",m["hdnb"]),("Away DNB",m["adnb"]),
          ("Home +1 Handicap",m["hp1"]),("Away +1 Handicap",m["ap1"]),
          ("Home -1 Handicap",m["hm1"]),("Away -1 Handicap",m["am1"])]
-    return sorted(({"name":n,"confidence":cap(v),"prob":round(v*100)} for n,v in raw),key=lambda z:-z["confidence"])
+    return sorted(
+        (
+            {
+                "name": n,
+                "confidence": conservative_confidence(v, (h["n"], a["n"])),
+                "prob": round(v * 100),
+            }
+            for n, v in raw
+        ),
+        key=lambda z: (-z["confidence"], -z["prob"]),
+    )
 
 def analysis(home,away,hs,as_,m):
     ms=markets(hs,as_,m); qualifying=[x for x in ms if x["confidence"]>=MIN_CONFIDENCE]
