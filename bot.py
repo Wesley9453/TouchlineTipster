@@ -3,6 +3,7 @@ import math
 import asyncio
 import threading
 import unicodedata
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -13,57 +14,28 @@ from telegram.ext import (
     ContextTypes,
 )
 
-VERSION = "3.4"
+VERSION = "3.5"
 API_BASE = "https://openfootapi.com/v1"
-SEASON = "2026/27"
 SAMPLE_SIZE = 5
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENFOOT_API_KEY = os.getenv("OPENFOOT_API_KEY")
 PORT = int(os.getenv("PORT", "10000"))
 
-COMPETITIONS = {
-    "MLS": "comp_mls_usa",
-    "USL Championship": "comp_usl_championship_usa",
-    "Championship": "comp_championship_eng",
-    "League One": "comp_league_one_eng",
-    "League Two": "comp_league_two_eng",
-    "Serie A": "comp_serie_a_it",
-    "Serie B": "comp_serie_b_it",
-    "Belgian Pro League": "comp_pro_league_be",
-    "Brazil Serie A": "comp_brasileirao_bra",
-    "Brazil Serie B": "comp_serie_b_bra",
-}
 
-COMPETITION_ALIASES = {
-    "mls": "comp_mls_usa",
-    "major league soccer": "comp_mls_usa",
-    "championship": "comp_championship_eng",
-    "efl championship": "comp_championship_eng",
-    "serie b": "comp_serie_b_it",
-    "italy serie b": "comp_serie_b_it",
-    "serie b italy": "comp_serie_b_it",
-    "italian serie b": "comp_serie_b_it",
-    "belgium": "comp_pro_league_be",
-    "belgian league": "comp_pro_league_be",
-    "belgian pro league": "comp_pro_league_be",
-    "pro league": "comp_pro_league_be",
-    "belgian first division": "comp_pro_league_be",
-    "brazil serie b": "comp_serie_b_bra",
-    "brasileirao serie b": "comp_serie_b_bra",
-}
-
-TEAM_ALIASES = {
-    "londrina": ["Londrina EC", "Londrina"],
-    "criciuma": ["Criciuma EC", "Criciúma", "Criciúma EC"],
-    "manchester city": ["Manchester City", "Manchester City FC"],
-    "manchester united": ["Manchester United", "Manchester United FC"],
-}
-
+# ============================================================
+# NAME NORMALIZATION
+# ============================================================
 
 def normalize_name(value):
+
     value = str(value or "").strip().lower()
-    value = unicodedata.normalize("NFKD", value)
+
+    value = unicodedata.normalize(
+        "NFKD",
+        value,
+    )
+
     value = "".join(
         c for c in value
         if not unicodedata.combining(c)
@@ -80,24 +52,37 @@ def normalize_name(value):
 # ============================================================
 
 def health_response():
-    return f"Touchline Tipster v{VERSION} is running."
+
+    return (
+        f"Touchline Tipster v{VERSION} "
+        "is running."
+    )
 
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+
+        self.send_header(
+            "Content-Type",
+            "text/plain",
+        )
+
         self.end_headers()
+
         self.wfile.write(
             health_response().encode()
         )
 
     def log_message(self, format, *args):
+
         return
 
 
 def start_health_server():
+
     server = HTTPServer(
         ("0.0.0.0", PORT),
         HealthHandler,
@@ -124,9 +109,14 @@ threading.Thread(
 def api_get(endpoint, params=None):
 
     if not OPENFOOT_API_KEY:
-        return None, "OPENFOOT_API_KEY is missing."
+
+        return (
+            None,
+            "OPENFOOT_API_KEY is missing.",
+        )
 
     try:
+
         response = requests.get(
             f"{API_BASE}{endpoint}",
             headers={
@@ -140,6 +130,7 @@ def api_get(endpoint, params=None):
         )
 
         if response.status_code != 200:
+
             return (
                 None,
                 f"API HTTP {response.status_code}: "
@@ -149,15 +140,25 @@ def api_get(endpoint, params=None):
         return response.json(), None
 
     except Exception as e:
-        return None, f"API request error: {e}"
 
+        return (
+            None,
+            f"API request error: {e}",
+        )
+
+
+# ============================================================
+# GLOBAL TEAM SEARCH
+# ============================================================
 
 def search_team(query):
 
     variants = []
+
     raw = str(query or "").strip()
 
     if raw:
+
         variants.append(raw)
 
     normalized = normalize_name(raw)
@@ -166,14 +167,8 @@ def search_team(query):
         normalize_name(x)
         for x in variants
     ]:
-        variants.append(normalized)
 
-    for alias in TEAM_ALIASES.get(
-        normalized,
-        [],
-    ):
-        if alias not in variants:
-            variants.append(alias)
+        variants.append(normalized)
 
     last_error = None
 
@@ -181,20 +176,25 @@ def search_team(query):
 
         data, error = api_get(
             "/search",
-            {"q": variant},
+            {
+                "q": variant,
+            },
         )
 
         if error:
+
             last_error = error
+
             continue
 
-        teams = data.get(
+        results = data.get(
             "data",
             [],
         )
 
-        if isinstance(teams, list) and teams:
-            return teams, None
+        if isinstance(results, list) and results:
+
+            return results, None
 
     return [], last_error
 
@@ -202,6 +202,7 @@ def search_team(query):
 def team_name(team):
 
     if not isinstance(team, dict):
+
         return str(team)
 
     return (
@@ -216,6 +217,7 @@ def team_name(team):
 def team_id(team):
 
     if not isinstance(team, dict):
+
         return None
 
     return (
@@ -228,100 +230,56 @@ def team_id(team):
 def team_country(team):
 
     if not isinstance(team, dict):
+
         return ""
 
     country = team.get("country")
 
     if isinstance(country, dict):
-        return country.get("name") or ""
 
-    return str(country or "")
-
-
-def extract_teams_from_standings(data):
-
-    rows = (
-        data.get("data", [])
-        if isinstance(data, dict)
-        else []
-    )
-
-    if isinstance(rows, dict):
-        rows = (
-            rows.get("standings")
-            or rows.get("table")
-            or rows.get("data")
-            or []
+        return (
+            country.get("name")
+            or ""
         )
 
-    if not isinstance(rows, list):
-        return []
-
-    found = []
-
-    for row in rows:
-
-        if not isinstance(row, dict):
-            continue
-
-        candidates = [
-            row.get("team"),
-            row.get("club"),
-            row.get("participant"),
-        ]
-
-        if any(
-            isinstance(x, dict)
-            for x in candidates
-        ):
-            found.append(
-                next(
-                    x for x in candidates
-                    if isinstance(x, dict)
-                )
-            )
-
-        elif row.get("name") and row.get("id"):
-            found.append(row)
-
-    return found
-
-
-def competition_id_for_query(query):
-
-    q = normalize_name(query)
-
-    if q in COMPETITION_ALIASES:
-        return COMPETITION_ALIASES[q]
-
-    for name, cid in COMPETITIONS.items():
-
-        if normalize_name(name) == q:
-            return cid
-
-    return None
+    return str(
+        country or ""
+    )
 
 
 def find_team(query):
 
-    teams, error = search_team(query)
+    teams, error = search_team(
+        query
+    )
 
     q = normalize_name(query)
 
     if teams:
 
+        # ----------------------------------------------------
+        # EXACT NAME MATCH
+        # ----------------------------------------------------
+
         exact = [
-            t for t in teams
+            t
+            for t in teams
             if normalize_name(
                 team_name(t)
             ) == q
         ]
 
         if exact:
+
             return exact[0], None
 
+        # ----------------------------------------------------
+        # PARTIAL NAME MATCH
+        # ----------------------------------------------------
+
         partial = [
-            t for t in teams
+            t
+            for t in teams
             if (
                 q in normalize_name(
                     team_name(t)
@@ -333,69 +291,18 @@ def find_team(query):
         ]
 
         if partial:
+
             return partial[0], None
+
+        # ----------------------------------------------------
+        # FIRST API RESULT
+        # ----------------------------------------------------
 
         return teams[0], None
 
-    fallback_competitions = []
+    if error:
 
-    known = TEAM_ALIASES.get(q)
-
-    if q in (
-        "londrina",
-        "criciuma",
-    ):
-        fallback_competitions = [
-            "comp_serie_b_bra"
-        ]
-
-    else:
-
-        cid = competition_id_for_query(q)
-
-        if cid:
-            fallback_competitions = [cid]
-
-    last_error = error
-
-    for cid in fallback_competitions:
-
-        data, standings_error = api_get(
-            "/standings",
-            {
-                "competition": cid,
-                "season": SEASON,
-            },
-        )
-
-        if standings_error:
-            last_error = standings_error
-            continue
-
-        for candidate in extract_teams_from_standings(
-            data
-        ):
-
-            cname = normalize_name(
-                team_name(candidate)
-            )
-
-            if (
-                cname == q
-                or q in cname
-                or cname in q
-            ):
-                return candidate, None
-
-            if known:
-
-                for alias in known:
-
-                    if normalize_name(alias) == cname:
-                        return candidate, None
-
-    if last_error:
-        return None, last_error
+        return None, error
 
     return (
         None,
@@ -410,21 +317,29 @@ def find_team(query):
 def number_value(value):
 
     if isinstance(value, bool):
+
         return None
 
     if isinstance(value, int):
+
         return value
 
     if isinstance(value, float):
+
         return int(value)
 
     if isinstance(value, str):
 
         try:
+
             return int(
-                float(value.strip())
+                float(
+                    value.strip()
+                )
             )
+
         except Exception:
+
             return None
 
     return None
@@ -433,6 +348,7 @@ def number_value(value):
 def extract_score_side(obj, keys):
 
     if not isinstance(obj, dict):
+
         return None
 
     for key in keys:
@@ -444,6 +360,7 @@ def extract_score_side(obj, keys):
             )
 
             if value is not None:
+
                 return value
 
     return None
@@ -452,6 +369,7 @@ def extract_score_side(obj, keys):
 def extract_scores(match):
 
     if not isinstance(match, dict):
+
         return None, None
 
     home = extract_score_side(
@@ -474,7 +392,11 @@ def extract_scores(match):
         ],
     )
 
-    if home is not None and away is not None:
+    if (
+        home is not None
+        and away is not None
+    ):
+
         return home, away
 
     for container_name in (
@@ -486,7 +408,10 @@ def extract_scores(match):
             container_name
         )
 
-        if isinstance(container, dict):
+        if isinstance(
+            container,
+            dict,
+        ):
 
             home = extract_score_side(
                 container,
@@ -512,6 +437,7 @@ def extract_scores(match):
                 home is not None
                 and away is not None
             ):
+
                 return home, away
 
             for side, keys in (
@@ -535,7 +461,9 @@ def extract_scores(match):
                 ),
             ):
 
-                obj = container.get(side)
+                obj = container.get(
+                    side
+                )
 
                 value = (
                     extract_score_side(
@@ -551,24 +479,21 @@ def extract_scores(match):
 
                 if side == "home":
 
-                    home = (
-                        value
-                        if value is not None
-                        else home
-                    )
+                    if value is not None:
+
+                        home = value
 
                 else:
 
-                    away = (
-                        value
-                        if value is not None
-                        else away
-                    )
+                    if value is not None:
+
+                        away = value
 
             if (
                 home is not None
                 and away is not None
             ):
+
                 return home, away
 
     return None, None
@@ -586,9 +511,14 @@ def match_kickoff(match):
 
 def match_status(match):
 
-    status = match.get("status")
+    status = match.get(
+        "status"
+    )
 
-    if isinstance(status, dict):
+    if isinstance(
+        status,
+        dict,
+    ):
 
         return str(
             status.get("type")
@@ -604,14 +534,20 @@ def match_status(match):
 
 def is_completed(match):
 
-    home, away = extract_scores(match)
+    home, away = extract_scores(
+        match
+    )
 
-    if home is None or away is None:
+    if (
+        home is None
+        or away is None
+    ):
+
         return False
 
     return not any(
-        w in match_status(match)
-        for w in [
+        word in match_status(match)
+        for word in [
             "scheduled",
             "upcoming",
             "pending",
@@ -627,37 +563,137 @@ def is_completed(match):
 
 def get_match_home_team(match):
 
-    home = match.get("homeTeam")
+    home = match.get(
+        "homeTeam"
+    )
 
     return (
         team_name(home)
-        if isinstance(home, dict)
-        else str(home or "Unknown")
+        if isinstance(
+            home,
+            dict,
+        )
+        else str(
+            home or "Unknown"
+        )
     )
 
 
 def get_match_away_team(match):
 
-    away = match.get("awayTeam")
+    away = match.get(
+        "awayTeam"
+    )
 
     return (
         team_name(away)
-        if isinstance(away, dict)
-        else str(away or "Unknown")
+        if isinstance(
+            away,
+            dict,
+        )
+        else str(
+            away or "Unknown"
+        )
     )
 
 
-def get_team_matches(team_id_value):
+# ============================================================
+# AUTOMATIC SEASON DETECTION
+# ============================================================
+
+def match_season(match):
+
+    if not isinstance(
+        match,
+        dict,
+    ):
+
+        return ""
+
+    possible = [
+        match.get("season"),
+        match.get("seasonLabel"),
+        match.get("season_name"),
+        match.get("seasonName"),
+    ]
+
+    competition = match.get(
+        "competition"
+    )
+
+    if isinstance(
+        competition,
+        dict,
+    ):
+
+        possible.extend(
+            [
+                competition.get(
+                    "season"
+                ),
+                competition.get(
+                    "seasonLabel"
+                ),
+            ]
+        )
+
+    for value in possible:
+
+        if value:
+
+            return str(value)
+
+    return ""
+
+
+def detect_season(matches):
+
+    seasons = [
+        match_season(m)
+        for m in matches
+        if match_season(m)
+    ]
+
+    if not seasons:
+
+        return "Current season"
+
+    counts = Counter(
+        seasons
+    )
+
+    return counts.most_common(1)[0][0]
+
+
+# ============================================================
+# GLOBAL MATCH RETRIEVAL
+# ============================================================
+
+def get_team_matches(
+    team_id_value,
+):
+
+    # IMPORTANT:
+    # No hard-coded season is supplied.
+    #
+    # OpenFootAPI chooses the appropriate current
+    # competition season for the requested team.
+    #
+    # This allows leagues such as:
+    # 2026/27
+    # 2026
+    # 2025/26
+    # etc.
 
     data, error = api_get(
         "/matches",
         {
             "team": team_id_value,
-            "season": SEASON,
         },
     )
 
     if error:
+
         return [], error
 
     matches = data.get(
@@ -665,11 +701,19 @@ def get_team_matches(team_id_value):
         []
     )
 
-    if not isinstance(matches, list):
-        return [], "Unexpected matches response."
+    if not isinstance(
+        matches,
+        list,
+    ):
+
+        return (
+            [],
+            "Unexpected matches response.",
+        )
 
     completed = [
-        m for m in matches
+        m
+        for m in matches
         if is_completed(m)
     ]
 
@@ -683,7 +727,9 @@ def get_team_matches(team_id_value):
 
 def same_team(a, b):
 
-    return bool(a and b) and (
+    return bool(
+        a and b
+    ) and (
         normalize_name(a)
         == normalize_name(b)
     )
@@ -725,15 +771,19 @@ def team_oriented_matches(
             else None
         )
 
-        home_name = get_match_home_team(
-            match
+        home_name = (
+            get_match_home_team(
+                match
+            )
         )
 
-        away_name = get_match_away_team(
-            match
+        away_name = (
+            get_match_away_team(
+                match
+            )
         )
 
-        if (
+        belongs = (
             home_id == target_team_id
             or away_id == target_team_id
             or same_team(
@@ -744,48 +794,59 @@ def team_oriented_matches(
                 away_name,
                 target_team_name,
             )
+        )
+
+        if not belongs:
+
+            continue
+
+        hs, aas = extract_scores(
+            match
+        )
+
+        if (
+            hs is None
+            or aas is None
         ):
 
-            hs, aas = extract_scores(
-                match
-            )
+            continue
 
-            if hs is None or aas is None:
-                continue
-
-            is_home = (
-                home_id == target_team_id
-                or same_team(
-                    home_name,
-                    target_team_name,
-                )
+        is_home = (
+            home_id == target_team_id
+            or same_team(
+                home_name,
+                target_team_name,
             )
+        )
 
-            result.append(
-                {
-                    "match": match,
-                    "is_home": is_home,
-                    "gf": (
-                        hs
-                        if is_home
-                        else aas
-                    ),
-                    "ga": (
-                        aas
-                        if is_home
-                        else hs
-                    ),
-                    "total": hs + aas,
-                    "date": match_kickoff(
-                        match
-                    ),
-                    "opponent": (
-                        away_name
-                        if is_home
-                        else home_name
-                    ),
-                }
-            )
+        result.append(
+            {
+                "match": match,
+                "is_home": is_home,
+                "gf": (
+                    hs
+                    if is_home
+                    else aas
+                ),
+                "ga": (
+                    aas
+                    if is_home
+                    else hs
+                ),
+                "total": hs + aas,
+                "date": match_kickoff(
+                    match
+                ),
+                "opponent": (
+                    away_name
+                    if is_home
+                    else home_name
+                ),
+                "season": match_season(
+                    match
+                ),
+            }
+        )
 
     result.sort(
         key=lambda x: x["date"],
@@ -802,9 +863,11 @@ def team_oriented_matches(
 def recency_weights(count):
 
     if count <= 0:
+
         return []
 
     if count == 1:
+
         return [1.0]
 
     step = 0.40 / (
@@ -820,6 +883,7 @@ def recency_weights(count):
 def weighted_average(values):
 
     if not values:
+
         return 0.0
 
     weights = recency_weights(
@@ -848,16 +912,20 @@ def weighted_rate(values):
 def calculate_stats(matches):
 
     if not matches:
+
         return None
 
     wins = []
     draws = []
     losses = []
+
     gf = []
     ga = []
+
     o15 = []
     o25 = []
     u35 = []
+
     btts = []
     scoring = []
     cs = []
@@ -867,23 +935,47 @@ def calculate_stats(matches):
         f = item["gf"]
         g = item["ga"]
 
-        wins.append(f > g)
-        draws.append(f == g)
-        losses.append(f < g)
+        wins.append(
+            f > g
+        )
+
+        draws.append(
+            f == g
+        )
+
+        losses.append(
+            f < g
+        )
 
         gf.append(f)
         ga.append(g)
 
         total = f + g
 
-        o15.append(total >= 2)
-        o25.append(total >= 3)
-        u35.append(total <= 3)
-        btts.append(
-            f > 0 and g > 0
+        o15.append(
+            total >= 2
         )
-        scoring.append(f > 0)
-        cs.append(g == 0)
+
+        o25.append(
+            total >= 3
+        )
+
+        u35.append(
+            total <= 3
+        )
+
+        btts.append(
+            f > 0
+            and g > 0
+        )
+
+        scoring.append(
+            f > 0
+        )
+
+        cs.append(
+            g == 0
+        )
 
     return {
         "count": len(matches),
@@ -895,22 +987,28 @@ def calculate_stats(matches):
         "avg_gf": weighted_average(gf),
         "avg_ga": weighted_average(ga),
         "over15": (
-            weighted_rate(o15) * 100
+            weighted_rate(o15)
+            * 100
         ),
         "over25": (
-            weighted_rate(o25) * 100
+            weighted_rate(o25)
+            * 100
         ),
         "under35": (
-            weighted_rate(u35) * 100
+            weighted_rate(u35)
+            * 100
         ),
         "btts": (
-            weighted_rate(btts) * 100
+            weighted_rate(btts)
+            * 100
         ),
         "scoring": (
-            weighted_rate(scoring) * 100
+            weighted_rate(scoring)
+            * 100
         ),
         "clean_sheet": (
-            weighted_rate(cs) * 100
+            weighted_rate(cs)
+            * 100
         ),
     }
 
@@ -930,7 +1028,8 @@ def form_string(matches):
 def get_home_matches(matches):
 
     return [
-        x for x in matches
+        x
+        for x in matches
         if x["is_home"]
     ]
 
@@ -938,7 +1037,8 @@ def get_home_matches(matches):
 def get_away_matches(matches):
 
     return [
-        x for x in matches
+        x
+        for x in matches
         if not x["is_home"]
     ]
 
@@ -947,7 +1047,9 @@ def blend(a, b, weight_a):
 
     return (
         a * weight_a
-        + b * (1.0 - weight_a)
+        + b * (
+            1.0 - weight_a
+        )
     )
 
 
@@ -959,13 +1061,17 @@ def estimate_xg(
 ):
 
     base = (
-        team_stats["avg_gf"] * 0.55
-        + opponent_stats["avg_ga"] * 0.45
+        team_stats["avg_gf"]
+        * 0.55
+        + opponent_stats["avg_ga"]
+        * 0.45
     )
 
     venue = (
-        venue_team["avg_gf"] * 0.55
-        + venue_opponent["avg_ga"] * 0.45
+        venue_team["avg_gf"]
+        * 0.55
+        + venue_opponent["avg_ga"]
+        * 0.45
     )
 
     n = venue_team["count"]
@@ -1005,13 +1111,17 @@ def poisson_probability(
 ):
 
     try:
+
         return (
             math.exp(-lmbda)
-            * (lmbda ** k)
+            * (
+                lmbda ** k
+            )
             / math.factorial(k)
         )
 
     except Exception:
+
         return 0.0
 
 
@@ -1046,6 +1156,7 @@ def poisson_matrix(
             )
 
             row.append(p)
+
             total += p
 
         matrix.append(row)
@@ -1068,50 +1179,71 @@ def matrix_markets(matrix):
     hw = 0.0
     d = 0.0
     aw = 0.0
+
     o05 = 0.0
     o15 = 0.0
     o25 = 0.0
+
     u35 = 0.0
     u45 = 0.0
+
     bt = 0.0
+
     hs = 0.0
     as_ = 0.0
 
-    for h, row in enumerate(matrix):
+    for h, row in enumerate(
+        matrix
+    ):
 
-        for a, p in enumerate(row):
+        for a, p in enumerate(
+            row
+        ):
 
             t = h + a
 
             if h > a:
+
                 hw += p
+
             elif h == a:
+
                 d += p
+
             else:
+
                 aw += p
 
             if t >= 1:
+
                 o05 += p
 
             if t >= 2:
+
                 o15 += p
 
             if t >= 3:
+
                 o25 += p
 
             if t <= 3:
+
                 u35 += p
 
             if t <= 4:
+
                 u45 += p
 
             if h > 0 and a > 0:
+
                 bt += p
 
             if h > 0:
+
                 hs += p
 
             if a > 0:
+
                 as_ += p
 
     return {
@@ -1172,22 +1304,30 @@ def grouped_goal_distribution(
         "five_plus": 0.0,
     }
 
-    for h, row in enumerate(matrix):
+    for h, row in enumerate(
+        matrix
+    ):
 
-        for a, p in enumerate(row):
+        for a, p in enumerate(
+            row
+        ):
 
             t = h + a
 
             if t <= 1:
+
                 d["zero_one"] += p
 
             elif t <= 3:
+
                 d["two_three"] += p
 
             elif t == 4:
+
                 d["four"] += p
 
             else:
+
                 d["five_plus"] += p
 
     return {
@@ -1283,9 +1423,11 @@ def calculate_model_confidence(
     )
 
     if disagreement == "MEDIUM":
+
         c -= 5
 
     elif disagreement == "HIGH":
+
         c -= 10
 
     return round(
@@ -1311,9 +1453,15 @@ def probability_audit(m):
         and m["under35"]
         <= m["under45"]
         and m["btts"]
-        <= m["home_score"] + 0.2
+        <= (
+            m["home_score"]
+            + 0.2
+        )
         and m["btts"]
-        <= m["away_score"] + 0.2
+        <= (
+            m["away_score"]
+            + 0.2
+        )
     )
 
 
@@ -1325,7 +1473,9 @@ def xg_sanity_check(
     return abs(
         (
             1
-            - math.exp(-total_xg)
+            - math.exp(
+                -total_xg
+            )
         ) * 100
         - over05
     ) <= 1.0
@@ -1357,10 +1507,14 @@ def format_stats(
         f"Avg "
         f"{s['avg_gf']:.2f}/"
         f"{s['avg_ga']:.2f} | "
-        f"O1.5 {pct(s['over15'])} | "
-        f"O2.5 {pct(s['over25'])} | "
-        f"U3.5 {pct(s['under35'])} | "
-        f"BTTS {pct(s['btts'])}\n"
+        f"O1.5 "
+        f"{pct(s['over15'])} | "
+        f"O2.5 "
+        f"{pct(s['over25'])} | "
+        f"U3.5 "
+        f"{pct(s['under35'])} | "
+        f"BTTS "
+        f"{pct(s['btts'])}\n"
         f"Scoring "
         f"{pct(s['scoring'])} | "
         f"CS "
@@ -1413,13 +1567,27 @@ def analyze_match(
     as_ = calculate_stats(ar)
 
     if not hs or not as_:
-        return None, "Not enough completed data."
 
-    hvm = get_home_matches(hr)
-    avm = get_away_matches(ar)
+        return (
+            None,
+            "Not enough completed data.",
+        )
 
-    hv = calculate_stats(hvm)
-    av = calculate_stats(avm)
+    hvm = get_home_matches(
+        hr
+    )
+
+    avm = get_away_matches(
+        ar
+    )
+
+    hv = calculate_stats(
+        hvm
+    )
+
+    av = calculate_stats(
+        avm
+    )
 
     if not hv:
 
@@ -1564,6 +1732,34 @@ def analyze_match(
         reverse=True,
     )
 
+    season_home = detect_season(
+        hr
+    )
+
+    season_away = detect_season(
+        ar
+    )
+
+    if (
+        season_home == season_away
+        and season_home != "Current season"
+    ):
+
+        display_season = season_home
+
+    elif season_home != "Current season":
+
+        display_season = (
+            f"{season_home} / "
+            f"{season_away}"
+        )
+
+    else:
+
+        display_season = (
+            "Current season"
+        )
+
     lines = [
         f"⚽ TOUCHLINE TIPSTER v{VERSION}",
         "",
@@ -1572,7 +1768,7 @@ def analyze_match(
         f"vs "
         f"{team_name(away_team)}",
         "",
-        f"Season: {SEASON}",
+        f"Season: {display_season}",
         f"Sample: Last "
         f"{SAMPLE_SIZE} "
         f"available matches",
@@ -1695,7 +1891,10 @@ def analyze_match(
         "will be correct.",
     ]
 
-    return "\n".join(lines), None
+    return (
+        "\n".join(lines),
+        None,
+    )
 
 
 # ============================================================
@@ -1717,10 +1916,12 @@ async def start_command(
         await update.message.reply_text(
             f"⚽ Welcome to Touchline Tipster "
             f"v{VERSION}!\n\n"
-            "I analyze football matches using "
-            "recent form, home/away evidence, "
-            "weighted statistics, expected goals "
-            "and a Poisson score model.\n\n"
+            "I analyze football matches across "
+            "OpenFootAPI's supported global "
+            "competitions using recent form, "
+            "home/away evidence, weighted "
+            "statistics, expected goals and a "
+            "Poisson score model.\n\n"
             "Commands:\n"
             "/team Chelsea\n"
             "/fixtures Chelsea\n"
@@ -1803,7 +2004,9 @@ async def team_command(
 
         return
 
-    country = team_country(t)
+    country = team_country(
+        t
+    )
 
     msg = (
         f"🔎 TEAM SEARCH\n\n"
@@ -1812,6 +2015,7 @@ async def team_command(
     )
 
     if country:
+
         msg += (
             f"\nCountry: {country}"
         )
@@ -1878,17 +2082,24 @@ async def fixtures_command(
     if not recent:
 
         await update.message.reply_text(
-            f"❌ No completed "
-            f"{SEASON} matches found "
+            f"❌ No completed current "
+            f"season matches found "
             f"for {team_name(t)}."
         )
 
         return
 
+    display_season = detect_season(
+        [
+            x["match"]
+            for x in recent
+        ]
+    )
+
     lines = [
         f"📅 {team_name(t)}",
         "",
-        f"Season: {SEASON}",
+        f"Season: {display_season}",
         "",
         f"Showing last "
         f"{len(recent)} "
@@ -1949,7 +2160,10 @@ async def analyze_command(
     home_q = home_q.strip()
     away_q = away_q.strip()
 
-    if not home_q or not away_q:
+    if (
+        not home_q
+        or not away_q
+    ):
 
         await update.message.reply_text(
             "Usage:\n"
@@ -2025,8 +2239,8 @@ async def analyze_command(
     if not hm:
 
         await update.message.reply_text(
-            f"❌ No recent "
-            f"{SEASON} data found "
+            f"❌ No recent current "
+            f"season data found "
             f"for {team_name(ht)}."
         )
 
@@ -2035,8 +2249,8 @@ async def analyze_command(
     if not am:
 
         await update.message.reply_text(
-            f"❌ No recent "
-            f"{SEASON} data found "
+            f"❌ No recent current "
+            f"season data found "
             f"for {team_name(at)}."
         )
 
@@ -2096,7 +2310,9 @@ async def start_telegram():
 
     application = (
         Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
+        .token(
+            TELEGRAM_BOT_TOKEN
+        )
         .build()
     )
 
@@ -2223,7 +2439,10 @@ async def start_telegram():
     try:
 
         while True:
-            await asyncio.sleep(3600)
+
+            await asyncio.sleep(
+                3600
+            )
 
     finally:
 
@@ -2276,4 +2495,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
