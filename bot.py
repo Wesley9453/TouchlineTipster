@@ -4,6 +4,7 @@ import asyncio
 import threading
 import unicodedata
 from collections import Counter
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -14,7 +15,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-VERSION = "3.5"
+VERSION = "3.6"
 API_BASE = "https://openfootapi.com/v1"
 SAMPLE_SIZE = 5
 
@@ -257,10 +258,6 @@ def find_team(query):
 
     if teams:
 
-        # ----------------------------------------------------
-        # EXACT NAME MATCH
-        # ----------------------------------------------------
-
         exact = [
             t
             for t in teams
@@ -272,10 +269,6 @@ def find_team(query):
         if exact:
 
             return exact[0], None
-
-        # ----------------------------------------------------
-        # PARTIAL NAME MATCH
-        # ----------------------------------------------------
 
         partial = [
             t
@@ -293,10 +286,6 @@ def find_team(query):
         if partial:
 
             return partial[0], None
-
-        # ----------------------------------------------------
-        # FIRST API RESULT
-        # ----------------------------------------------------
 
         return teams[0], None
 
@@ -598,8 +587,27 @@ def get_match_away_team(match):
 
 
 # ============================================================
-# AUTOMATIC SEASON DETECTION
+# SEASON DETECTION
 # ============================================================
+
+def season_text(value):
+
+    if isinstance(value, dict):
+
+        return str(
+            value.get("label")
+            or value.get("name")
+            or value.get("season")
+            or value.get("id")
+            or ""
+        )
+
+    if value is None:
+
+        return ""
+
+    return str(value)
+
 
 def match_season(match):
 
@@ -634,14 +642,22 @@ def match_season(match):
                 competition.get(
                     "seasonLabel"
                 ),
+                competition.get(
+                    "season_name"
+                ),
+                competition.get(
+                    "seasonName"
+                ),
             ]
         )
 
     for value in possible:
 
-        if value:
+        text = season_text(value).strip()
 
-            return str(value)
+        if text:
+
+            return text
 
     return ""
 
@@ -666,6 +682,73 @@ def detect_season(matches):
 
 
 # ============================================================
+# CURRENT SEASON CANDIDATES
+# ============================================================
+
+def current_season_candidates():
+
+    year = datetime.now(
+        timezone.utc
+    ).year
+
+    next_year = year + 1
+    previous_year = year - 1
+
+    candidates = [
+        f"{year}/{str(next_year)[-2:]}",
+        str(year),
+        f"{previous_year}/{str(year)[-2:]}",
+        str(previous_year),
+        f"{year}-{str(next_year)[-2:]}",
+        f"{previous_year}-{str(year)[-2:]}",
+    ]
+
+    unique = []
+
+    for season in candidates:
+
+        if season not in unique:
+
+            unique.append(season)
+
+    return unique
+
+
+def season_matches_requested(
+    matches,
+    requested_season,
+):
+
+    labeled = [
+        match_season(m)
+        for m in matches
+        if match_season(m)
+    ]
+
+    if not labeled:
+
+        # Some API responses may omit the season
+        # even when the season filter was accepted.
+        return True
+
+    normalized_requested = normalize_name(
+        requested_season
+    )
+
+    for label in labeled:
+
+        normalized_label = normalize_name(
+            label
+        )
+
+        if normalized_label == normalized_requested:
+
+            return True
+
+    return False
+
+
+# ============================================================
 # GLOBAL MATCH RETRIEVAL
 # ============================================================
 
@@ -673,56 +756,132 @@ def get_team_matches(
     team_id_value,
 ):
 
-    # IMPORTANT:
-    # No hard-coded season is supplied.
-    #
-    # OpenFootAPI chooses the appropriate current
-    # competition season for the requested team.
-    #
-    # This allows leagues such as:
-    # 2026/27
-    # 2026
-    # 2025/26
-    # etc.
-
-    data, error = api_get(
-        "/matches",
-        {
-            "team": team_id_value,
-        },
-    )
-
-    if error:
-
-        return [], error
-
-    matches = data.get(
-        "data",
-        []
-    )
-
-    if not isinstance(
-        matches,
-        list,
-    ):
+    if not team_id_value:
 
         return (
             [],
-            "Unexpected matches response.",
+            "Team ID is missing.",
         )
 
-    completed = [
-        m
-        for m in matches
-        if is_completed(m)
-    ]
-
-    completed.sort(
-        key=match_kickoff,
-        reverse=True,
+    candidates = (
+        current_season_candidates()
     )
 
-    return completed, None
+    print(
+        f"🔎 Checking current seasons for "
+        f"{team_id_value}: "
+        f"{', '.join(candidates)}",
+        flush=True,
+    )
+
+    last_error = None
+
+    for season in candidates:
+
+        print(
+            f"🔎 Trying season {season} "
+            f"for {team_id_value}...",
+            flush=True,
+        )
+
+        data, error = api_get(
+            "/matches",
+            {
+                "team": team_id_value,
+                "season": season,
+            },
+        )
+
+        if error:
+
+            print(
+                f"⚠️ Season {season} request failed: "
+                f"{error}",
+                flush=True,
+            )
+
+            last_error = error
+
+            continue
+
+        matches = data.get(
+            "data",
+            [],
+        )
+
+        if not isinstance(
+            matches,
+            list,
+        ):
+
+            print(
+                f"⚠️ Unexpected response for "
+                f"season {season}.",
+                flush=True,
+            )
+
+            continue
+
+        if not season_matches_requested(
+            matches,
+            season,
+        ):
+
+            print(
+                f"⚠️ API returned a different "
+                f"season instead of {season}. "
+                f"Ignoring that response.",
+                flush=True,
+            )
+
+            continue
+
+        completed = [
+            m
+            for m in matches
+            if is_completed(m)
+        ]
+
+        completed.sort(
+            key=match_kickoff,
+            reverse=True,
+        )
+
+        if completed:
+
+            print(
+                f"✅ Found {len(completed)} "
+                f"completed matches for "
+                f"{team_id_value} in season "
+                f"{season}.",
+                flush=True,
+            )
+
+            return completed, None
+
+        print(
+            f"ℹ️ No completed matches found "
+            f"for {team_id_value} in "
+            f"season {season}.",
+            flush=True,
+        )
+
+    return (
+        [],
+        (
+            f"No completed current-season "
+            f"matches found for this team. "
+            f"Checked: "
+            f"{', '.join(candidates)}."
+        )
+        if not last_error
+        else
+        (
+            f"No completed current-season "
+            f"matches found. Last API error: "
+            f"{last_error}"
+        ),
+    )
 
 
 def same_team(a, b):
