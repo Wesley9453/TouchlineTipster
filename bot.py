@@ -1,6 +1,5 @@
 import os
 import asyncio
-import math
 import threading
 from statistics import mean
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -16,7 +15,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# TOUCHLINE TIPSTER v4.2
+# TOUCHLINE TIPSTER v4.1
 # ============================================================
 # Core Telegram/backend baseline for the Touchline Tipster app.
 #
@@ -46,7 +45,7 @@ FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"Touchline Tipster v4.2 is running."
+        body = b"Touchline Tipster v4.1 is running."
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -287,68 +286,6 @@ def form_string(fixtures, team_id):
     return "".join(form)
 
 
-def poisson_probability(lam, k):
-    lam = max(0.01, float(lam))
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
-
-
-def seven_outcomes(home, away):
-    # Estimate expected goals from each team's scoring rate and opponent's
-    # conceding rate, then derive the seven core outcome probabilities.
-    home_xg = max(0.10, (home["avg_scored"] + away["avg_conceded"]) / 2)
-    away_xg = max(0.10, (away["avg_scored"] + home["avg_conceded"]) / 2)
-
-    matrix = {}
-    home_win = draw = away_win = over25 = under25 = btts_yes = 0.0
-    for hg in range(0, 9):
-        for ag in range(0, 9):
-            p = poisson_probability(home_xg, hg) * poisson_probability(away_xg, ag)
-            matrix[(hg, ag)] = p
-            if hg > ag:
-                home_win += p
-            elif hg == ag:
-                draw += p
-            else:
-                away_win += p
-            if hg + ag >= 3:
-                over25 += p
-            else:
-                under25 += p
-            if hg > 0 and ag > 0:
-                btts_yes += p
-
-    outcomes = [
-        ("Home Win", home_win * 100),
-        ("Draw", draw * 100),
-        ("Away Win", away_win * 100),
-        ("Over 2.5 Goals", over25 * 100),
-        ("Under 2.5 Goals", under25 * 100),
-        ("Both Teams To Score â Yes", btts_yes * 100),
-        ("Both Teams To Score â No", (1 - btts_yes) * 100),
-    ]
-
-    scores = sorted(
-        ((score, probability * 100) for score, probability in matrix.items()),
-        key=lambda x: x[1],
-        reverse=True,
-    )[:5]
-
-    return {
-        "home_xg": home_xg,
-        "away_xg": away_xg,
-        "outcomes": [
-            {"market": name, "confidence": max(1, min(97, prob)),
-             "risk": risk(max(1, min(97, prob))),
-             "advice": advice(max(1, min(97, prob)))}
-            for name, prob in outcomes
-        ],
-        "scores": [
-            {"score": f"{hg}-{ag}", "probability": prob}
-            for (hg, ag), prob in scores
-        ],
-    }
-
-
 # ------------------------------------------------------------
 # MARKET ENGINE
 # ------------------------------------------------------------
@@ -411,10 +348,10 @@ MARKETS = [
 
 def risk(conf):
     if conf >= 75:
-        return "ð¢ HIGH"
+        return " HIGH"
     if conf >= 55:
-        return "ð¡ MEDIUM"
-    return "ð´ RISKY"
+        return " MEDIUM"
+    return " RISKY"
 
 
 def advice(conf):
@@ -486,7 +423,6 @@ def analyze_match(home_name, away_name):
         "away_form": form_string(away_fixtures, away_id),
         "h2h": h2h,
         "markets": rank_markets(home_stats, away_stats),
-        "seven_outcomes": seven_outcomes(home_stats, away_stats),
     }, None
 
 
@@ -496,12 +432,12 @@ def analyze_match(home_name, away_name):
 
 def analyze_sportybet_code(code):
     if not code.strip():
-        return "â Please provide a SportyBet code."
+        return " Please provide a SportyBet code."
 
     return (
-        "ðï¸ SPORTYBET CODE ANALYSIS\n\n"
+        " SPORTYBET CODE ANALYSIS\n\n"
         f"Code: {code.strip()}\n\n"
-        "â ï¸ I will never invent or guess selections inside a code.\n"
+        " I will never invent or guess selections inside a code.\n"
         "The actual selections must first be resolved by a supported "
         "SportyBet integration before they can be analyzed or rebuilt."
     )
@@ -570,78 +506,53 @@ def format_analysis(result):
     aws = result["away_stats"]
 
     lines = [
-        f"â½ TOUCHLINE TIPSTER v{VERSION}",
+        f" TOUCHLINE TIPSTER v{VERSION}",
         "",
-        f"ðï¸ {h['name']} vs {a['name']}",
-        f"ð Season: {FIXTURE_SEASON}",
-        f"ð¢ Sample: Last {SAMPLE_SIZE} available matches",
+        f" {h['name']} vs {a['name']}",
+        f" Season: {FIXTURE_SEASON}",
+        f" Sample: Last {SAMPLE_SIZE} available matches",
         "",
-        "ââââââââââââââââââââ",
-        "ð  HOME TEAM",
-        "ââââââââââââââââââââ",
+        "",
+        " HOME TEAM",
+        "",
         stats_text(h["name"], hs, result["home_form"]),
         "",
-        "ðï¸ HOME VENUE",
+        " HOME VENUE",
         f"Games: {result['home_venue']['games']}",
         f"Avg scored: {result['home_venue']['avg_scored']:.2f}",
         f"Avg conceded: {result['home_venue']['avg_conceded']:.2f}",
         f"Over 2.5: {result['home_venue']['over25']:.0f}%",
         f"BTTS: {result['home_venue']['btts']:.0f}%",
         "",
-        "ââââââââââââââââââââ",
-        "âï¸ AWAY TEAM",
-        "ââââââââââââââââââââ",
+        "",
+        " AWAY TEAM",
+        "",
         stats_text(a["name"], aws, result["away_form"]),
         "",
-        "ð£ï¸ AWAY VENUE",
+        " AWAY VENUE",
         f"Games: {result['away_venue']['games']}",
         f"Avg scored: {result['away_venue']['avg_scored']:.2f}",
         f"Avg conceded: {result['away_venue']['avg_conceded']:.2f}",
         f"Over 2.5: {result['away_venue']['over25']:.0f}%",
         f"BTTS: {result['away_venue']['btts']:.0f}%",
         "",
-        "ââââââââââââââââââââ",
-        "ð¯ SEVEN CORE OUTCOMES",
-        "ââââââââââââââââââââ",
+        "",
+        " MARKET RANKING",
+        "",
     ]
-
-    for i, item in enumerate(result["seven_outcomes"]["outcomes"], 1):
-        lines.append(
-            f"{i}. {item['market']} â "
-            f"{item['confidence']:.0f}% {item['risk']} â {item['advice']}"
-        )
-
-    lines.extend([
-        "",
-        "ð¯ POSSIBLE CORRECT SCORES",
-    ])
-
-    for item in result["seven_outcomes"]["scores"]:
-        score_conf = item["probability"]
-        lines.append(
-            f"â¢ {item['score']} â {score_conf:.1f}% "
-            f"{risk(score_conf)}"
-        )
-
-    lines.extend([
-        "",
-        "ââââââââââââââââââââ",
-        "ð¯ MARKET RANKING",
-        "ââââââââââââââââââââ",
-    ])
 
     for i, item in enumerate(result["markets"], 1):
         lines.append(
-            f"{i}. {item['market']} â "
+            f"{i}. {item['market']}  "
             f"{item['confidence']:.0f}% "
-            f"{item['risk']} â {item['advice']}"
+            f"{item['risk']}  {item['advice']}"
         )
 
     lines.extend([
         "",
-        f"ð¤ H2H matches available: {len(result['h2h'])}",
+        f" H2H matches available: {len(result['h2h'])}",
         "",
-        "â ï¸ Statistical guidance only. No result is guaranteed.",
+        " Statistical guidance only. No result is guaranteed.",
     ])
 
     return "\n".join(lines)
@@ -653,8 +564,8 @@ def format_analysis(result):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"â½ Welcome to Touchline Tipster v{VERSION}!\n\n"
-        "ð§  AI football analysis and betting intelligence.\n\n"
+        f" Welcome to Touchline Tipster v{VERSION}!\n\n"
+        " AI football analysis and betting intelligence.\n\n"
         "Commands:\n"
         "/analyze Chelsea vs Arsenal\n"
         "/pick Chelsea vs Arsenal\n"
@@ -675,11 +586,11 @@ async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     team, error = find_team(" ".join(context.args))
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     await update.message.reply_text(
-        f"â½ TEAM\n\n"
+        f" TEAM\n\n"
         f"Name: {team.get('name')}\n"
         f"ID: {team.get('id')}\n"
         f"Country: {team.get('country', 'N/A')}"
@@ -693,12 +604,12 @@ async def fixtures_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     team, error = find_team(" ".join(context.args))
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     fixtures, error = get_team_fixtures(team["id"])
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     if not fixtures:
@@ -708,7 +619,7 @@ async def fixtures_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [
-        f"ð {team['name']} â Last {SAMPLE_SIZE}",
+        f" {team['name']}  Last {SAMPLE_SIZE}",
         f"Season: {FIXTURE_SEASON}",
         "",
     ]
@@ -736,14 +647,14 @@ async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text("ð Analyzing historical statistics...")
+    await update.message.reply_text(" Analyzing historical statistics...")
 
     result, error = await asyncio.to_thread(
         analyze_match, match[0], match[1]
     )
 
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     await update.message.reply_text(format_analysis(result))
@@ -761,19 +672,19 @@ async def pick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     best = result["markets"][0]
 
     await update.message.reply_text(
-        f"ð¯ TOUCHLINE TIPSTER PICK\n\n"
-        f"ðï¸ {result['home']['name']} vs {result['away']['name']}\n\n"
-        f"ð {best['market']}\n"
+        f" TOUCHLINE TIPSTER PICK\n\n"
+        f" {result['home']['name']} vs {result['away']['name']}\n\n"
+        f" {best['market']}\n"
         f"Confidence: {best['confidence']:.0f}%\n"
         f"{best['risk']}\n"
         f"Advice: {best['advice']}\n\n"
-        "â ï¸ Statistical guidance only."
+        " Statistical guidance only."
     )
 
 
@@ -789,18 +700,18 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     lines = [
-        f"ð¯ MARKETS â {result['home']['name']} vs {result['away']['name']}",
+        f" MARKETS  {result['home']['name']} vs {result['away']['name']}",
         "",
     ]
 
     for item in result["markets"]:
         lines.append(
             f"{item['risk']} {item['market']}: "
-            f"{item['confidence']:.0f}% â {item['advice']}"
+            f"{item['confidence']:.0f}%  {item['advice']}"
         )
 
     await update.message.reply_text("\n".join(lines))
@@ -815,17 +726,17 @@ async def h2h_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     home, error = find_team(match[0])
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     away, error = find_team(match[1])
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     fixtures, error = get_h2h(home["id"], away["id"])
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     if not fixtures:
@@ -833,7 +744,7 @@ async def h2h_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [
-        f"ð¤ H2H â {home['name']} vs {away['name']}",
+        f" H2H  {home['name']} vs {away['name']}",
         "",
     ]
 
@@ -865,7 +776,7 @@ async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if error:
         await update.message.reply_text(
-            f"â Football API connection failed.\n\n{error}"
+            f" Football API connection failed.\n\n{error}"
         )
         return
 
@@ -873,7 +784,7 @@ async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subscription = data.get("response", {}).get("subscription", {})
 
     await update.message.reply_text(
-        "â Football API connection works.\n\n"
+        " Football API connection works.\n\n"
         f"Plan: {subscription.get('plan', 'N/A')}\n"
         f"Active: {subscription.get('active', 'N/A')}\n"
         f"Account: {account.get('firstname', 'N/A')}"
@@ -906,6 +817,14 @@ async def natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     match = parse_match(text)
 
     if not match:
+        await update.message.reply_text(
+            " Give me a match like:\n"
+            "Chelsea vs Arsenal\n\n"
+            "Examples:\n"
+            " Analyze Chelsea vs Arsenal\n"
+            " Pick Chelsea vs Arsenal\n"
+            " Chelsea vs Arsenal Over 2.5"
+        )
         return
 
     result, error = await asyncio.to_thread(
@@ -913,7 +832,7 @@ async def natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if error:
-        await update.message.reply_text(f"â {error}")
+        await update.message.reply_text(f" {error}")
         return
 
     market = requested_market(text)
@@ -926,12 +845,12 @@ async def natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if selected:
             await update.message.reply_text(
-                f"ð¯ {market}\n\n"
-                f"ðï¸ {result['home']['name']} vs {result['away']['name']}\n"
+                f" {market}\n\n"
+                f" {result['home']['name']} vs {result['away']['name']}\n"
                 f"Confidence: {selected['confidence']:.0f}%\n"
                 f"{selected['risk']}\n"
                 f"Advice: {selected['advice']}\n\n"
-                "â ï¸ Statistical guidance only."
+                " Statistical guidance only."
             )
             return
 
