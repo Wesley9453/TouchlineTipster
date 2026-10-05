@@ -1,9 +1,7 @@
 import os
-import re
-import math
 import asyncio
 import threading
-from datetime import datetime, timezone
+from statistics import mean
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -17,1013 +15,886 @@ from telegram.ext import (
 )
 
 # ============================================================
-# TOUCHLINE TIPSTER v4.0
+# TOUCHLINE TIPSTER v4.1
+# ============================================================
+# Core Telegram/backend baseline for the Touchline Tipster app.
+#
+# Environment variables:
+#   TELEGRAM_BOT_TOKEN
+#   FOOTBALL_API_KEY
+#
+# Optional:
+#   PORT
+#   FIXTURE_SEASON
 # ============================================================
 
-VERSION = "4.0"
-OPENFOOT_BASE = os.getenv("OPENFOOT_API_BASE", "https://openfootapi.com/v1")
-OPENFOOT_API_KEY = os.getenv("OPENFOOT_API_KEY", os.getenv("FOOTBALL_API_KEY", ""))
-SPORTYBET_BASE = os.getenv("SPORTYBET_API_BASE_URL", "https://www.sportybet.com")
-SPORTYBET_REGION = os.getenv("SPORTYBET_REGION", "gh").lower()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
+VERSION = "4.1"
+API_BASE = "https://v3.football.api-sports.io"
 PORT = int(os.getenv("PORT", "10000"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-MAX_MATCHES = 100
+FIXTURE_SEASON = int(os.getenv("FIXTURE_SEASON", "2024"))
+SAMPLE_SIZE = 10
+TIMEOUT = 20
 
-# Target odds supported by the command engine.
-MIN_ODDS = 1.50
-MAX_ODDS = 100_000_000.00
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
 
-# ============================================================
+# ------------------------------------------------------------
 # RENDER HEALTH SERVER
-# ============================================================
+# ------------------------------------------------------------
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = f"Touchline Tipster v{VERSION} is running."
+        body = b"Touchline Tipster v4.1 is running."
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body.encode())))
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body.encode())
+        self.wfile.write(body)
 
-    def log_message(self, format, *args):
-        return
+    def log_message(self, *_):
+        pass
 
 
 def start_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    print(f"Touchline Tipster v{VERSION} is running on port {PORT}.")
-    server.serve_forever()
+    HTTPServer(("0.0.0.0", PORT), HealthHandler).serve_forever()
 
 
-# ============================================================
-# HTTP HELPERS
-# ============================================================
+# ------------------------------------------------------------
+# FOOTBALL API
+# ------------------------------------------------------------
 
-def get_json(url, params=None, headers=None):
+def api_get(endpoint, params=None):
+    if not FOOTBALL_API_KEY:
+        return None, "FOOTBALL_API_KEY is missing."
+
     try:
-        h = {"Accept": "application/json"}
-        if headers:
-            h.update(headers)
-
         response = requests.get(
-            url,
-            params=params,
-            headers=h,
-            timeout=REQUEST_TIMEOUT,
+            API_BASE + endpoint,
+            headers={"x-apisports-key": FOOTBALL_API_KEY},
+            params=params or {},
+            timeout=TIMEOUT,
         )
 
-        try:
-            data = response.json()
-        except Exception:
-            data = {}
+        if response.status_code != 200:
+            return None, f"API HTTP {response.status_code}: {response.text[:250]}"
 
-        if not response.ok:
-            return None, f"HTTP {response.status_code}: {data}"
+        data = response.json()
+
+        if data.get("errors"):
+            return None, str(data["errors"])
 
         return data, None
 
     except requests.RequestException as exc:
-        return None, str(exc)
+        return None, f"API connection error: {exc}"
 
 
-def openfoot_get(path, params=None):
-    headers = {}
-    if OPENFOOT_API_KEY:
-        headers["Authorization"] = f"Bearer {OPENFOOT_API_KEY}"
+def find_team(name):
+    data, error = api_get("/teams", {"search": name.strip()})
+    if error:
+        return None, error
 
-    return get_json(f"{OPENFOOT_BASE.rstrip('/')}/{path.lstrip('/')}", params, headers)
+    results = data.get("response", [])
+    if not results:
+        return None, f"No team found for '{name}'."
+
+    target = name.strip().lower()
+
+    for item in results:
+        team = item.get("team", {})
+        if team.get("name", "").lower() == target:
+            return team, None
+
+    return results[0].get("team", {}), None
 
 
-def sportybet_get(path, params=None):
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Current-Country": SPORTYBET_REGION.upper(),
-    }
-
-    return get_json(
-        f"{SPORTYBET_BASE.rstrip('/')}/{path.lstrip('/')}",
-        params,
-        headers,
+def get_team_fixtures(team_id, last=SAMPLE_SIZE):
+    data, error = api_get(
+        "/fixtures",
+        {
+            "team": team_id,
+            "season": FIXTURE_SEASON,
+            "last": last,
+        },
     )
-
-
-# ============================================================
-# GENERAL UTILITIES
-# ============================================================
-
-def clean_name(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
-
-
-def fmt_odds(value):
-    try:
-        return f"{float(value):.2f}"
-    except Exception:
-        return "N/A"
-
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def risk_from_odds(odds):
-    """A simple risk label based on individual odds, not a guarantee."""
-    try:
-        o = float(odds)
-    except Exception:
-        return "ð´ HIGH"
-
-    if o <= 1.35:
-        return "ð¢ LOW"
-    if o <= 1.75:
-        return "ð¡ MEDIUM"
-    return "ð´ HIGH"
-
-
-def confidence_from_odds(odds):
-    """
-    Converts individual decimal odds to an indicative probability.
-    This is not a bookmaker guarantee and does not remove margin.
-    """
-    try:
-        o = float(odds)
-        if o <= 1:
-            return 50
-        return round(clamp((1 / o) * 100, 5, 95))
-    except Exception:
-        return 0
-
-
-def extract_code(text):
-    # Supports normal six-character SportyBet booking codes and longer
-    # custom codes. Avoids treating common words as codes.
-    candidates = re.findall(r"\b[A-Za-z0-9]{6,24}\b", text.upper())
-    blocked = {
-        "ANALYZE", "ANALYSE", "SELECT", "PICK", "MATCHES", "SELECTIONS",
-        "SPORTYBET", "TOUCHLINE", "TIPSTER", "BETTING", "AROUND",
-        "SAFEST", "CODE", "ODDS", "GAMES",
-    }
-    for item in candidates:
-        if item not in blocked and re.search(r"[A-Z]", item) and re.search(r"\d", item):
-            return item
-    return None
-
-
-def parse_number(value):
-    try:
-        return float(str(value).replace(",", "").strip())
-    except Exception:
-        return None
-
-
-def parse_command_requirements(text):
-    """
-    Distinction locked into v4.0:
-      '5 odds'       -> target total odds 5.00
-      '5.00 odds'    -> target total odds 5.00
-      '5 matches'    -> 5 selections
-      '5 games'      -> 5 selections
-      '5 selections' -> 5 selections
-    """
-    low = text.lower()
-
-    target_odds = None
-    selection_count = None
-
-    # Number + odds
-    odds_patterns = [
-        r"\b(?:around|about|at|of|near|target(?:ing)?|make it|give me|pick|select)?\s*"
-        r"(\d+(?:[.,]\d+)?)\s*(?:total\s*)?odds\b",
-        r"\bodds\s*(?:of|around|about|=|:)?\s*(\d+(?:[.,]\d+)?)\b",
-    ]
-
-    for pattern in odds_patterns:
-        match = re.search(pattern, low)
-        if match:
-            target_odds = parse_number(match.group(1))
-            break
-
-    # Number + matches/games/selections
-    match_patterns = [
-        r"\b(\d+)\s*(?:matches|match|games|game|selections|selection|picks|legs)\b",
-        r"\b(?:matches|games|selections|picks|legs)\s*(?:of|=|:)?\s*(\d+)\b",
-    ]
-
-    for pattern in match_patterns:
-        match = re.search(pattern, low)
-        if match:
-            selection_count = int(match.group(1))
-            break
-
-    if target_odds is not None:
-        target_odds = clamp(target_odds, MIN_ODDS, MAX_ODDS)
-
-    return target_odds, selection_count
-
-
-def parse_risk_level(text):
-    low = text.lower()
-
-    if any(x in low for x in ("safe", "safest", "low risk", "lower risk", "conservative")):
-        return "LOW"
-    if any(x in low for x in ("aggressive", "risky", "high risk", "highest")):
-        return "HIGH"
-    return "BALANCED"
-
-
-# ============================================================
-# SPORTYBET CODE ENGINE
-# ============================================================
-
-def flatten_booking_outcomes(payload):
-    """
-    SportyBet's undocumented web payload can change shape. This parser
-    accepts several common shapes and only returns fields it can actually
-    identify.
-    """
-    if not payload:
-        return []
-
-    data = payload.get("data", payload)
-
-    possible = []
-    if isinstance(data, dict):
-        for key in ("outcomes", "selections", "bets", "legs"):
-            value = data.get(key)
-            if isinstance(value, list):
-                possible.extend(value)
-
-    if isinstance(data, list):
-        possible.extend(data)
-
-    result = []
-
-    for item in possible:
-        if not isinstance(item, dict):
-            continue
-
-        event_name = (
-            item.get("eventName")
-            or item.get("matchName")
-            or item.get("eventDesc")
-            or item.get("event")
-            or ""
-        )
-
-        market = (
-            item.get("marketName")
-            or item.get("marketDesc")
-            or item.get("market")
-            or item.get("desc")
-            or ""
-        )
-
-        outcome = (
-            item.get("outcomeName")
-            or item.get("outcomeDesc")
-            or item.get("selection")
-            or item.get("outcome")
-            or ""
-        )
-
-        odds = (
-            item.get("odds")
-            or item.get("odd")
-            or item.get("price")
-        )
-
-        # Sometimes outcome is nested.
-        nested = item.get("outcome")
-        if isinstance(nested, dict):
-            odds = odds or nested.get("odds") or nested.get("price")
-            outcome = (
-                nested.get("desc")
-                or nested.get("name")
-                or nested.get("outcomeName")
-                or outcome
-            )
-
-        try:
-            odds_float = float(odds)
-        except Exception:
-            continue
-
-        result.append({
-            "event": clean_name(event_name) or "Unknown match",
-            "market": clean_name(market) or "Unknown market",
-            "selection": clean_name(outcome) or "Unknown selection",
-            "odds": odds_float,
-        })
-
-    return result
-
-
-def resolve_sportybet_code(code):
-    path = f"/api/{SPORTYBET_REGION}/orders/share/{code}"
-    payload, error = sportybet_get(path)
 
     if error:
         return [], error
 
-    selections = flatten_booking_outcomes(payload)
-
-    if not selections:
-        return [], (
-            "The code was reached, but SportyBet did not return readable "
-            "selection details in the response."
-        )
-
-    return selections, None
+    return data.get("response", []), None
 
 
-def selection_score(selection, risk_level="BALANCED"):
-    odds = selection["odds"]
-
-    # Lower odds are generally less volatile, but don't call them guaranteed.
-    base = confidence_from_odds(odds)
-
-    if risk_level == "LOW":
-        risk_bonus = max(0, 20 - odds * 5)
-    elif risk_level == "HIGH":
-        risk_bonus = min(20, odds * 2)
-    else:
-        risk_bonus = max(0, 12 - odds * 2)
-
-    return base + risk_bonus
-
-
-def select_best_selections(selections, count=None, target_odds=None, risk_level="BALANCED"):
-    if not selections:
-        return []
-
-    ranked = sorted(
-        selections,
-        key=lambda x: selection_score(x, risk_level),
-        reverse=True,
+def get_h2h(team1_id, team2_id, last=10):
+    data, error = api_get(
+        "/fixtures/headtohead",
+        {
+            "h2h": f"{team1_id}-{team2_id}",
+            "last": last,
+        },
     )
 
-    if target_odds is None:
-        return ranked[:count] if count else ranked
+    if error:
+        return [], error
 
-    # Build a combination close to the target while prioritizing stronger
-    # selections. For very large targets, greedily add strong selections.
-    selected = []
-    combined = 1.0
-
-    candidates = ranked[:]
-
-    if risk_level == "LOW":
-        candidates = sorted(candidates, key=lambda x: x["odds"])
-
-    for item in candidates:
-        if count is not None and len(selected) >= count:
-            break
-
-        new_total = combined * item["odds"]
-
-        # Prefer not to overshoot when alternatives exist.
-        if new_total <= target_odds * 1.08 or not selected:
-            selected.append(item)
-            combined = new_total
-
-        if combined >= target_odds * 0.97:
-            break
-
-    # If a requested count is larger, fill it with best unused selections.
-    if count and len(selected) < count:
-        used = {id(x) for x in selected}
-        for item in ranked:
-            if id(item) in used:
-                continue
-            selected.append(item)
-            if len(selected) >= count:
-                break
-
-    return selected
+    return data.get("response", []), None
 
 
-def combined_odds(selections):
-    total = 1.0
-    for item in selections:
-        try:
-            total *= float(item["odds"])
-        except Exception:
-            pass
-    return total
+# ------------------------------------------------------------
+# STATISTICS
+# ------------------------------------------------------------
 
-
-def format_code_analysis(code, selections):
-    lines = [
-        f"ðï¸ TOUCHLINE TIPSTER v{VERSION}",
-        "",
-        f"SportyBet code: `{code}`",
-        f"Selections detected: {len(selections)}",
-        "",
-        "ð AVAILABLE SELECTIONS",
-        "ââââââââââââââââââ",
-    ]
-
-    for i, item in enumerate(selections, 1):
-        lines.append(
-            f"{i}. {item['event']}\n"
-            f"   {item['market']} â {item['selection']} "
-            f"@ {fmt_odds(item['odds'])} "
-            f"{risk_from_odds(item['odds'])}"
-        )
-
-    total = combined_odds(selections)
-    lines.extend([
-        "",
-        f"ð Combined odds of all detected selections: {fmt_odds(total)}",
-        "â ï¸ Odds/risk indicators are informational, not guarantees.",
-    ])
-
-    return "\n".join(lines)
-
-
-def format_selected_ticket(selected, target_odds=None, count=None, risk_level="BALANCED"):
-    total = combined_odds(selected)
-
-    lines = [
-        f"ð TOUCHLINE TIPSTER v{VERSION}",
-        "",
-        "ð¯ TICKET OPTIMIZER",
-        f"Risk mode: {risk_level}",
-    ]
-
-    if count:
-        lines.append(f"Requested matches: {count}")
-    if target_odds:
-        lines.append(f"Target odds: {fmt_odds(target_odds)}")
-
-    lines.extend([
-        "",
-        "SELECTED",
-        "ââââââââââââââââââ",
-    ])
-
-    for i, item in enumerate(selected, 1):
-        confidence = confidence_from_odds(item["odds"])
-        lines.append(
-            f"{i}. {item['event']}\n"
-            f"   {item['market']} â {item['selection']}\n"
-            f"   Odds: {fmt_odds(item['odds'])} | {risk_from_odds(item['odds'])} | "
-            f"Indicative probability: {confidence}%"
-        )
-
-    lines.extend([
-        "",
-        f"ð Built combined odds: {fmt_odds(total)}",
-    ])
-
-    if target_odds:
-        difference = total - target_odds
-        lines.append(f"ð Difference from target: {difference:+.2f}")
-
-        if total >= target_odds * 0.97 and total <= target_odds * 1.08:
-            lines.append("â Target range achieved closely.")
-        elif total < target_odds:
-            lines.append("â¹ï¸ Target could not be reached closely with the available selections.")
-        else:
-            lines.append("â ï¸ Result is above the requested target.")
-
-    if total >= 1000:
-        lines.append("ð´ VERY HIGH RISK: combined odds are extremely high.")
-    elif total >= 100:
-        lines.append("ð´ HIGH RISK: combined odds are very high.")
-    elif total >= 20:
-        lines.append("ð¡ HIGH-VARIANCE TICKET: combined odds are high.")
-    else:
-        lines.append("â ï¸ No betting outcome is guaranteed.")
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# OPENFOOT MATCH ENGINE
-# ============================================================
-
-def search_team(team_name):
-    payload, error = openfoot_get("/search", {"q": team_name})
-
-    if error or not payload:
-        return None, error or "No response from OpenFoot."
-
-    data = payload.get("data", [])
-    if isinstance(data, dict):
-        data = data.get("results", data.get("teams", []))
-
-    if not isinstance(data, list) or not data:
-        return None, f"No team found for {team_name}."
-
-    # Prefer a team result.
-    for item in data:
-        if isinstance(item, dict) and item.get("type", "team") in ("team", "club"):
-            return item, None
-
-    return data[0], None
-
-
-def get_team_matches(team_id, status="finished", limit=10):
-    params = {
-        "team": team_id,
-        "status": status,
+def is_finished(fixture):
+    return fixture.get("fixture", {}).get("status", {}).get("short") in {
+        "FT", "AET", "PEN", "AWD", "WO"
     }
 
-    payload, error = openfoot_get("/matches", params)
 
-    if error or not payload:
-        return [], error or "No response from OpenFoot."
+def team_score(fixture, team_id):
+    teams = fixture.get("teams", {})
+    goals = fixture.get("goals", {})
 
-    data = payload.get("data", [])
-    if not isinstance(data, list):
-        return [], "Unexpected matches response."
+    home_id = teams.get("home", {}).get("id")
+    away_id = teams.get("away", {}).get("id")
+    home_goals = goals.get("home")
+    away_goals = goals.get("away")
 
-    # For finished matches, newest first is normally returned. Sort safely.
-    def kickoff_key(item):
-        return item.get("kickoffAt", "")
-
-    data = sorted(data, key=kickoff_key, reverse=True)
-    return data[:limit], None
-
-
-def match_goals(match):
-    score = match.get("score") or match.get("scores") or {}
-
-    if isinstance(score, dict):
-        home = (
-            score.get("home")
-            or score.get("homeScore")
-            or score.get("homeGoals")
-        )
-        away = (
-            score.get("away")
-            or score.get("awayScore")
-            or score.get("awayGoals")
-        )
-        if isinstance(home, dict):
-            home = home.get("current") or home.get("fullTime")
-        if isinstance(away, dict):
-            away = away.get("current") or away.get("fullTime")
-
-    else:
-        home = away = None
-
-    try:
-        return int(home), int(away)
-    except Exception:
-        return None, None
-
-
-def calculate_team_stats(matches, team_id):
-    rows = []
-
-    for match in matches:
-        home = match.get("homeTeam", {})
-        away = match.get("awayTeam", {})
-
-        home_id = home.get("id")
-        away_id = away.get("id")
-        hg, ag = match_goals(match)
-
-        if hg is None or ag is None:
-            continue
-
-        if home_id == team_id:
-            gf, ga = hg, ag
-        elif away_id == team_id:
-            gf, ga = ag, hg
-        else:
-            continue
-
-        result = "W" if gf > ga else "D" if gf == ga else "L"
-        rows.append({
-            "gf": gf,
-            "ga": ga,
-            "result": result,
-            "total": gf + ga,
-            "btts": gf > 0 and ga > 0,
-            "over15": gf + ga > 1,
-            "over25": gf + ga > 2,
-            "clean": ga == 0,
-        })
-
-    if not rows:
+    if home_goals is None or away_goals is None:
         return None
 
-    n = len(rows)
+    if team_id == home_id:
+        return home_goals, away_goals
+    if team_id == away_id:
+        return away_goals, home_goals
+
+    return None
+
+
+def calculate_stats(fixtures, team_id):
+    stats = {
+        "games": 0,
+        "wins": 0,
+        "draws": 0,
+        "losses": 0,
+        "scored": [],
+        "conceded": [],
+        "totals": [],
+        "btts": 0,
+        "clean_sheets": 0,
+        "failed_to_score": 0,
+    }
+
+    for fixture in fixtures:
+        if not is_finished(fixture):
+            continue
+
+        score = team_score(fixture, team_id)
+        if score is None:
+            continue
+
+        gf, ga = score
+        total = gf + ga
+
+        stats["games"] += 1
+        stats["scored"].append(gf)
+        stats["conceded"].append(ga)
+        stats["totals"].append(total)
+
+        if gf > ga:
+            stats["wins"] += 1
+        elif gf == ga:
+            stats["draws"] += 1
+        else:
+            stats["losses"] += 1
+
+        stats["btts"] += int(gf > 0 and ga > 0)
+        stats["clean_sheets"] += int(ga == 0)
+        stats["failed_to_score"] += int(gf == 0)
+
+    return stats
+
+
+def summarize(stats):
+    games = stats["games"]
+
+    if games == 0:
+        return {
+            "games": 0,
+            "wins": 0,
+            "draws": 0,
+            "losses": 0,
+            "avg_scored": 0,
+            "avg_conceded": 0,
+            "over15": 0,
+            "over25": 0,
+            "over35": 0,
+            "under25": 0,
+            "under35": 0,
+            "btts": 0,
+            "clean_sheet": 0,
+            "failed_to_score": 0,
+        }
+
+    totals = stats["totals"]
 
     return {
-        "form": "".join(x["result"] for x in rows),
-        "wins": sum(x["result"] == "W" for x in rows),
-        "draws": sum(x["result"] == "D" for x in rows),
-        "losses": sum(x["result"] == "L" for x in rows),
-        "avg_gf": sum(x["gf"] for x in rows) / n,
-        "avg_ga": sum(x["ga"] for x in rows) / n,
-        "over15": sum(x["over15"] for x in rows) / n * 100,
-        "over25": sum(x["over25"] for x in rows) / n * 100,
-        "btts": sum(x["btts"] for x in rows) / n * 100,
-        "clean": sum(x["clean"] for x in rows) / n * 100,
-        "sample": n,
+        "games": games,
+        "wins": stats["wins"],
+        "draws": stats["draws"],
+        "losses": stats["losses"],
+        "avg_scored": mean(stats["scored"]),
+        "avg_conceded": mean(stats["conceded"]),
+        "over15": sum(x > 1.5 for x in totals) / games * 100,
+        "over25": sum(x > 2.5 for x in totals) / games * 100,
+        "over35": sum(x > 3.5 for x in totals) / games * 100,
+        "under25": sum(x < 2.5 for x in totals) / games * 100,
+        "under35": sum(x < 3.5 for x in totals) / games * 100,
+        "btts": stats["btts"] / games * 100,
+        "clean_sheet": stats["clean_sheets"] / games * 100,
+        "failed_to_score": stats["failed_to_score"] / games * 100,
     }
 
 
-def format_team_stats(name, stats):
-    if not stats:
-        return f"{name}: insufficient completed-match data."
+def split_home_away(fixtures, team_id):
+    home = []
+    away = []
 
-    return (
-        f"ð  {name}\n"
-        f"Form: {stats['form']} | W/D/L: "
-        f"{stats['wins']}/{stats['draws']}/{stats['losses']}\n"
-        f"Goals: {stats['avg_gf']:.2f} scored / {stats['avg_ga']:.2f} conceded\n"
-        f"Over 1.5: {stats['over15']:.0f}% | "
-        f"Over 2.5: {stats['over25']:.0f}% | "
-        f"BTTS: {stats['btts']:.0f}% | "
-        f"Clean sheet: {stats['clean']:.0f}%"
-    )
-
-
-async def analyze_match(home_name, away_name):
-    home_team, home_error = await asyncio.to_thread(search_team, home_name)
-    away_team, away_error = await asyncio.to_thread(search_team, away_name)
-
-    if not home_team:
-        return f"â Could not find the home team: {home_name}\n{home_error or ''}"
-    if not away_team:
-        return f"â Could not find the away team: {away_name}\n{away_error or ''}"
-
-    home_id = home_team.get("id")
-    away_id = away_team.get("id")
-
-    home_matches, e1 = await asyncio.to_thread(get_team_matches, home_id, "finished", 10)
-    away_matches, e2 = await asyncio.to_thread(get_team_matches, away_id, "finished", 10)
-
-    hs = calculate_team_stats(home_matches, home_id)
-    aws = calculate_team_stats(away_matches, away_id)
-
-    if not hs or not aws:
-        return (
-            f"â½ TOUCHLINE TIPSTER v{VERSION}\n\n"
-            f"ðï¸ {home_name} vs {away_name}\n\n"
-            "â Not enough completed-match data was returned."
-        )
-
-    # Market signals are descriptive, not guaranteed predictions.
-    over15 = (hs["over15"] + aws["over15"]) / 2
-    over25 = (hs["over25"] + aws["over25"]) / 2
-    btts = (hs["btts"] + aws["btts"]) / 2
-    under45 = 100 - (
-        (
-            sum(x["total"] > 4 for x in [
-                {"total": 0}
-            ])
-        )
-    )
-
-    # Under 4.5 from available average goal rates as a simple indicator.
-    expected_total = hs["avg_gf"] + hs["avg_ga"] + aws["avg_gf"] + aws["avg_ga"]
-    under45_indicator = clamp(100 - max(0, expected_total - 3) * 20, 45, 95)
-
-    markets = [
-        ("Over 1.5 Goals", over15),
-        ("Over 2.5 Goals", over25),
-        ("BTTS", btts),
-        ("Under 4.5 Goals", under45_indicator),
-    ]
-
-    markets.sort(key=lambda x: x[1], reverse=True)
-    best_market, best_conf = markets[0]
-
-    if best_conf >= 80:
-        risk = "ð¢ LOW"
-    elif best_conf >= 65:
-        risk = "ð¡ MEDIUM"
-    else:
-        risk = "ð´ HIGH"
-
-    lines = [
-        f"â½ TOUCHLINE TIPSTER v{VERSION}",
-        "",
-        f"ðï¸ {home_name} vs {away_name}",
-        "",
-        format_team_stats(home_name, hs),
-        "",
-        format_team_stats(away_name, aws),
-        "",
-        "ð MARKET RANKING",
-        "ââââââââââââââââââ",
-    ]
-
-    for i, (market, confidence) in enumerate(markets, 1):
-        icon = "ð¢" if confidence >= 80 else "ð¡" if confidence >= 65 else "ð´"
-        lines.append(f"{icon} {i}. {market} â {confidence:.0f}%")
-
-    lines.extend([
-        "",
-        f"ð BEST PICK: {best_market}",
-        f"Confidence indicator: {best_conf:.0f}%",
-        f"Risk: {risk}",
-        "",
-        "â ï¸ Statistical indicators are not guarantees.",
-    ])
-
-    return "\n".join(lines)
-
-
-# ============================================================
-# COMMAND PARSER
-# ============================================================
-
-def extract_matchup(text):
-    match = re.search(
-        r"(.+?)\s+(?:vs\.?|v\.?)\s+(.+?)(?:$|[.!?])",
-        text,
-        re.IGNORECASE,
-    )
-    if not match:
-        return None, None
-
-    home = clean_name(match.group(1))
-    away = clean_name(match.group(2))
-
-    # Remove command words from the first side if present.
-    home = re.sub(
-        r"^(?:analyze|analyse|check|review|study|pick|select)\s+",
-        "",
-        home,
-        flags=re.IGNORECASE,
-    )
+    for fixture in fixtures:
+        teams = fixture.get("teams", {})
+        if teams.get("home", {}).get("id") == team_id:
+            home.append(fixture)
+        elif teams.get("away", {}).get("id") == team_id:
+            away.append(fixture)
 
     return home, away
 
 
-async def handle_code_request(update, text, code):
-    target_odds, selection_count = parse_command_requirements(text)
-    risk_level = parse_risk_level(text)
+def form_string(fixtures, team_id):
+    form = []
 
-    selections, error = await asyncio.to_thread(resolve_sportybet_code, code)
+    for fixture in fixtures:
+        if not is_finished(fixture):
+            continue
 
+        score = team_score(fixture, team_id)
+        if not score:
+            continue
+
+        gf, ga = score
+        form.append("W" if gf > ga else "D" if gf == ga else "L")
+
+    return "".join(form)
+
+
+# ------------------------------------------------------------
+# MARKET ENGINE
+# ------------------------------------------------------------
+
+def confidence(home, away, market):
+    hg = max(home["games"], 1)
+    ag = max(away["games"], 1)
+
+    if market == "Over 2.5":
+        value = (home["over25"] + away["over25"]) / 2
+
+    elif market == "Under 4.5":
+        value = 100 - ((home["over35"] + away["over35"]) / 2) * 0.65
+
+    elif market == "BTTS":
+        value = (home["btts"] + away["btts"]) / 2
+
+    elif market == "Home Win":
+        value = 50 + (
+            (home["wins"] / hg * 100 - 50) * 0.60
+            + (away["losses"] / ag * 100 - 50) * 0.25
+        )
+
+    elif market == "Away Win":
+        value = 50 + (
+            (away["wins"] / ag * 100 - 50) * 0.60
+            + (home["losses"] / hg * 100 - 50) * 0.25
+        )
+
+    elif market == "Double Chance 1X":
+        value = 100 - (home["losses"] / hg * 100) * 0.65
+
+    elif market == "Double Chance X2":
+        value = 100 - (away["losses"] / ag * 100) * 0.65
+
+    elif market == "Home Team Over 0.5":
+        value = 100 - home["failed_to_score"] * 0.85
+
+    elif market == "Away Team Over 0.5":
+        value = 100 - away["failed_to_score"] * 0.85
+
+    else:
+        value = 50
+
+    return max(1, min(97, value))
+
+
+MARKETS = [
+    "Under 4.5",
+    "Double Chance 1X",
+    "Double Chance X2",
+    "Home Team Over 0.5",
+    "Away Team Over 0.5",
+    "Over 2.5",
+    "BTTS",
+    "Home Win",
+    "Away Win",
+]
+
+
+def risk(conf):
+    if conf >= 75:
+        return "ð¢ HIGH"
+    if conf >= 55:
+        return "ð¡ MEDIUM"
+    return "ð´ RISKY"
+
+
+def advice(conf):
+    if conf >= 75:
+        return "BET"
+    if conf >= 55:
+        return "CAUTION"
+    return "AVOID"
+
+
+def rank_markets(home, away):
+    rows = []
+
+    for market in MARKETS:
+        c = confidence(home, away, market)
+        rows.append({
+            "market": market,
+            "confidence": c,
+            "risk": risk(c),
+            "advice": advice(c),
+        })
+
+    return sorted(rows, key=lambda row: row["confidence"], reverse=True)
+
+
+# ------------------------------------------------------------
+# COMPLETE MATCH ANALYSIS
+# ------------------------------------------------------------
+
+def analyze_match(home_name, away_name):
+    home_team, error = find_team(home_name)
     if error:
-        await update.message.reply_text(
-            f"â I couldn't fully read SportyBet code `{code}`.\n\n"
-            f"{error}\n\n"
-            "The code must be readable through SportyBet's booking-code service. "
-            "I will not invent missing selections."
-        )
-        return
+        return None, error
 
-    low = text.lower()
+    away_team, error = find_team(away_name)
+    if error:
+        return None, error
 
-    is_analysis = any(
-        word in low for word in ("analyze", "analyse", "check", "review", "study")
+    home_id = home_team["id"]
+    away_id = away_team["id"]
+
+    home_fixtures, error = get_team_fixtures(home_id)
+    if error:
+        return None, error
+
+    away_fixtures, error = get_team_fixtures(away_id)
+    if error:
+        return None, error
+
+    h2h, _ = get_h2h(home_id, away_id)
+
+    home_stats = summarize(calculate_stats(home_fixtures, home_id))
+    away_stats = summarize(calculate_stats(away_fixtures, away_id))
+
+    home_games, _ = split_home_away(home_fixtures, home_id)
+    _, away_games = split_home_away(away_fixtures, away_id)
+
+    home_venue = summarize(calculate_stats(home_games, home_id))
+    away_venue = summarize(calculate_stats(away_games, away_id))
+
+    return {
+        "home": home_team,
+        "away": away_team,
+        "home_stats": home_stats,
+        "away_stats": away_stats,
+        "home_venue": home_venue,
+        "away_venue": away_venue,
+        "home_form": form_string(home_fixtures, home_id),
+        "away_form": form_string(away_fixtures, away_id),
+        "h2h": h2h,
+        "markets": rank_markets(home_stats, away_stats),
+    }, None
+
+
+# ------------------------------------------------------------
+# SPORTYBET CODE SAFETY
+# ------------------------------------------------------------
+
+def analyze_sportybet_code(code):
+    if not code.strip():
+        return "â Please provide a SportyBet code."
+
+    return (
+        "ðï¸ SPORTYBET CODE ANALYSIS\n\n"
+        f"Code: {code.strip()}\n\n"
+        "â ï¸ I will never invent or guess selections inside a code.\n"
+        "The actual selections must first be resolved by a supported "
+        "SportyBet integration before they can be analyzed or rebuilt."
     )
 
-    wants_selection = any(
-        word in low for word in ("pick", "select", "choose", "give me", "keep")
+
+# ------------------------------------------------------------
+# NATURAL LANGUAGE PARSING
+# ------------------------------------------------------------
+
+def parse_match(text):
+    lower = text.lower()
+
+    for separator in (" vs ", " v ", " versus ", " - "):
+        if separator in lower:
+            index = lower.index(separator)
+            a = text[:index].strip()
+            b = text[index + len(separator):].strip()
+            if a and b:
+                return a, b
+
+    return None
+
+
+def requested_market(text):
+    t = text.lower()
+
+    if "over 2.5" in t:
+        return "Over 2.5"
+    if "under 4.5" in t:
+        return "Under 4.5"
+    if "btts" in t or "both teams to score" in t:
+        return "BTTS"
+    if "1x" in t or "home or draw" in t:
+        return "Double Chance 1X"
+    if "x2" in t or "draw or away" in t:
+        return "Double Chance X2"
+    if "home win" in t:
+        return "Home Win"
+    if "away win" in t:
+        return "Away Win"
+
+    return None
+
+
+# ------------------------------------------------------------
+# OUTPUT
+# ------------------------------------------------------------
+
+def stats_text(name, stats, form):
+    return (
+        f"{name}\n"
+        f"Form: {form or 'N/A'}\n"
+        f"W/D/L: {stats['wins']}/{stats['draws']}/{stats['losses']}\n"
+        f"Games: {stats['games']}\n"
+        f"Avg goals: {stats['avg_scored']:.2f}\n"
+        f"Avg conceded: {stats['avg_conceded']:.2f}\n"
+        f"Over 2.5: {stats['over25']:.0f}%\n"
+        f"BTTS: {stats['btts']:.0f}%"
     )
 
-    if is_analysis and not wants_selection and not target_odds and not selection_count:
-        await update.message.reply_text(
-            format_code_analysis(code, selections)
+
+def format_analysis(result):
+    h = result["home"]
+    a = result["away"]
+    hs = result["home_stats"]
+    aws = result["away_stats"]
+
+    lines = [
+        f"â½ TOUCHLINE TIPSTER v{VERSION}",
+        "",
+        f"ðï¸ {h['name']} vs {a['name']}",
+        f"ð Season: {FIXTURE_SEASON}",
+        f"ð¢ Sample: Last {SAMPLE_SIZE} available matches",
+        "",
+        "ââââââââââââââââââââ",
+        "ð  HOME TEAM",
+        "ââââââââââââââââââââ",
+        stats_text(h["name"], hs, result["home_form"]),
+        "",
+        "ðï¸ HOME VENUE",
+        f"Games: {result['home_venue']['games']}",
+        f"Avg scored: {result['home_venue']['avg_scored']:.2f}",
+        f"Avg conceded: {result['home_venue']['avg_conceded']:.2f}",
+        f"Over 2.5: {result['home_venue']['over25']:.0f}%",
+        f"BTTS: {result['home_venue']['btts']:.0f}%",
+        "",
+        "ââââââââââââââââââââ",
+        "âï¸ AWAY TEAM",
+        "ââââââââââââââââââââ",
+        stats_text(a["name"], aws, result["away_form"]),
+        "",
+        "ð£ï¸ AWAY VENUE",
+        f"Games: {result['away_venue']['games']}",
+        f"Avg scored: {result['away_venue']['avg_scored']:.2f}",
+        f"Avg conceded: {result['away_venue']['avg_conceded']:.2f}",
+        f"Over 2.5: {result['away_venue']['over25']:.0f}%",
+        f"BTTS: {result['away_venue']['btts']:.0f}%",
+        "",
+        "ââââââââââââââââââââ",
+        "ð¯ MARKET RANKING",
+        "ââââââââââââââââââââ",
+    ]
+
+    for i, item in enumerate(result["markets"], 1):
+        lines.append(
+            f"{i}. {item['market']} â "
+            f"{item['confidence']:.0f}% "
+            f"{item['risk']} â {item['advice']}"
         )
-        return
 
-    if not wants_selection and not target_odds and not selection_count:
-        await update.message.reply_text(
-            format_code_analysis(code, selections)
-        )
-        return
+    lines.extend([
+        "",
+        f"ð¤ H2H matches available: {len(result['h2h'])}",
+        "",
+        "â ï¸ Statistical guidance only. No result is guaranteed.",
+    ])
 
-    selected = select_best_selections(
-        selections,
-        count=selection_count,
-        target_odds=target_odds,
-        risk_level=risk_level,
-    )
-
-    if not selected:
-        await update.message.reply_text("â I couldn't build a selection from the code.")
-        return
-
-    await update.message.reply_text(
-        format_selected_ticket(
-            selected,
-            target_odds=target_odds,
-            count=selection_count,
-            risk_level=risk_level,
-        )
-    )
+    return "\n".join(lines)
 
 
-# ============================================================
-# TELEGRAM HANDLERS
-# ============================================================
+# ------------------------------------------------------------
+# TELEGRAM COMMANDS
+# ------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = f"""
-â½ TOUCHLINE TIPSTER v{VERSION}
-
-Your football analysis and ticket-selection assistant.
-
-ð§  I understand:
-â¢ Analyze
-â¢ Pick
-â¢ Select
-â¢ Choose
-â¢ Check
-â¢ Review
-
-ðï¸ SPORTYBET
-Send a booking code and ask:
-â¢ Analyze this code
-â¢ Pick the best 5 matches
-â¢ Pick the best 5 odds
-â¢ Pick 5 matches around 10 odds
-â¢ Make it safer
-
-ð ODDS RULE
-5 odds = 5.00 total odds
-5 matches = 5 selections
-
-ð¯ Supported target:
-1.50 â 100,000,000.00 odds
-
-â½ MATCH ANALYSIS
-/analyze Chelsea vs Arsenal
-
-Other commands:
-/help
-/apitest
-/version
-"""
-    await update.message.reply_text(text.strip())
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"""
-â½ TOUCHLINE TIPSTER v{VERSION}
-
-EXAMPLES
-
-ð Match:
-Analyze Chelsea vs Arsenal
-
-ðï¸ SportyBet:
-Analyze this code ABC123
-
-ð¯ Number of matches:
-Pick 5 matches
-
-ð Total odds:
-Pick 5 odds
-
-ð Both:
-Pick 5 matches around 10 odds
-
-ð¡ï¸ Risk:
-Pick the safest 5 matches
-Pick 10 matches, 20 odds, balanced
-Make this code safer
-
-ð IMPORTANT
-â5 oddsâ means 5.00 combined odds.
-â5 matchesâ means 5 selections.
-
-The bot only uses selections it can actually resolve.
-No missing SportyBet selection will be invented.
-""".strip()
+        f"â½ Welcome to Touchline Tipster v{VERSION}!\n\n"
+        "ð§  AI football analysis and betting intelligence.\n\n"
+        "Commands:\n"
+        "/analyze Chelsea vs Arsenal\n"
+        "/pick Chelsea vs Arsenal\n"
+        "/markets Chelsea vs Arsenal\n"
+        "/h2h Chelsea vs Arsenal\n"
+        "/team Chelsea\n"
+        "/fixtures Chelsea\n"
+        "/code YOUR_SPORTYBET_CODE\n"
+        "/apitest\n\n"
+        "Natural language is also supported."
     )
 
 
-async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def team_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /team Chelsea")
+        return
+
+    team, error = find_team(" ".join(context.args))
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
     await update.message.reply_text(
-        f"â½ Touchline Tipster v{VERSION}\n"
-        "Command engine: ON\n"
-        "SportyBet engine: ON\n"
-        "Ticket optimizer: ON\n"
-        "Risk ranking: ON"
+        f"â½ TEAM\n\n"
+        f"Name: {team.get('name')}\n"
+        f"ID: {team.get('id')}\n"
+        f"Country: {team.get('country', 'N/A')}"
+    )
+
+
+async def fixtures_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /fixtures Chelsea")
+        return
+
+    team, error = find_team(" ".join(context.args))
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    fixtures, error = get_team_fixtures(team["id"])
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    if not fixtures:
+        await update.message.reply_text(
+            f"No fixtures found for {team['name']} in season {FIXTURE_SEASON}."
+        )
+        return
+
+    lines = [
+        f"ð {team['name']} â Last {SAMPLE_SIZE}",
+        f"Season: {FIXTURE_SEASON}",
+        "",
+    ]
+
+    for fixture in fixtures:
+        teams = fixture.get("teams", {})
+        goals = fixture.get("goals", {})
+        date = fixture.get("fixture", {}).get("date", "")[:10]
+        home = teams.get("home", {}).get("name", "?")
+        away = teams.get("away", {}).get("name", "?")
+        gh = goals.get("home")
+        ga = goals.get("away")
+        score = f"{gh}-{ga}" if gh is not None and ga is not None else "vs"
+        lines.append(f"{date}  {home} {score} {away}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = parse_match(" ".join(context.args)) if context.args else None
+
+    if not match:
+        await update.message.reply_text(
+            "Usage: /analyze Team A vs Team B"
+        )
+        return
+
+    await update.message.reply_text("ð Analyzing historical statistics...")
+
+    result, error = await asyncio.to_thread(
+        analyze_match, match[0], match[1]
+    )
+
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    await update.message.reply_text(format_analysis(result))
+
+
+async def pick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = parse_match(" ".join(context.args)) if context.args else None
+
+    if not match:
+        await update.message.reply_text("Usage: /pick Team A vs Team B")
+        return
+
+    result, error = await asyncio.to_thread(
+        analyze_match, match[0], match[1]
+    )
+
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    best = result["markets"][0]
+
+    await update.message.reply_text(
+        f"ð¯ TOUCHLINE TIPSTER PICK\n\n"
+        f"ðï¸ {result['home']['name']} vs {result['away']['name']}\n\n"
+        f"ð {best['market']}\n"
+        f"Confidence: {best['confidence']:.0f}%\n"
+        f"{best['risk']}\n"
+        f"Advice: {best['advice']}\n\n"
+        "â ï¸ Statistical guidance only."
+    )
+
+
+async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = parse_match(" ".join(context.args)) if context.args else None
+
+    if not match:
+        await update.message.reply_text("Usage: /markets Team A vs Team B")
+        return
+
+    result, error = await asyncio.to_thread(
+        analyze_match, match[0], match[1]
+    )
+
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    lines = [
+        f"ð¯ MARKETS â {result['home']['name']} vs {result['away']['name']}",
+        "",
+    ]
+
+    for item in result["markets"]:
+        lines.append(
+            f"{item['risk']} {item['market']}: "
+            f"{item['confidence']:.0f}% â {item['advice']}"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def h2h_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    match = parse_match(" ".join(context.args)) if context.args else None
+
+    if not match:
+        await update.message.reply_text("Usage: /h2h Team A vs Team B")
+        return
+
+    home, error = find_team(match[0])
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    away, error = find_team(match[1])
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    fixtures, error = get_h2h(home["id"], away["id"])
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    if not fixtures:
+        await update.message.reply_text("No H2H data was returned.")
+        return
+
+    lines = [
+        f"ð¤ H2H â {home['name']} vs {away['name']}",
+        "",
+    ]
+
+    for fixture in fixtures:
+        teams = fixture.get("teams", {})
+        goals = fixture.get("goals", {})
+        date = fixture.get("fixture", {}).get("date", "")[:10]
+        hn = teams.get("home", {}).get("name", "?")
+        an = teams.get("away", {}).get("name", "?")
+        lines.append(
+            f"{date}  {hn} {goals.get('home')}-{goals.get('away')} {an}"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /code YOUR_SPORTYBET_CODE")
+        return
+
+    await update.message.reply_text(
+        analyze_sportybet_code(" ".join(context.args))
     )
 
 
 async def apitest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    payload, error = await asyncio.to_thread(
-        openfoot_get, "/health"
-    )
+    data, error = await asyncio.to_thread(api_get, "/status", {})
 
     if error:
         await update.message.reply_text(
-            f"â Football API test failed.\n{error}"
+            f"â Football API connection failed.\n\n{error}"
         )
         return
+
+    account = data.get("response", {}).get("account", {})
+    subscription = data.get("response", {}).get("subscription", {})
 
     await update.message.reply_text(
-        "â Football API connection works.\n"
-        f"OpenFoot response received successfully."
+        "â Football API connection works.\n\n"
+        f"Plan: {subscription.get('plan', 'N/A')}\n"
+        f"Active: {subscription.get('active', 'N/A')}\n"
+        f"Account: {account.get('firstname', 'N/A')}"
     )
 
 
-async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
+# ------------------------------------------------------------
+# NATURAL LANGUAGE HANDLER
+# ------------------------------------------------------------
+
+async def natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    lower = text.lower()
+
+    if not text:
+        return
+
+    if "sportybet code" in lower or lower.startswith("code "):
+        code = text
+        code = code.replace("SportyBet code", "").replace(
+            "sportybet code", ""
+        ).strip()
+
+        if code.lower().startswith("code "):
+            code = code[5:].strip()
+
+        await update.message.reply_text(analyze_sportybet_code(code))
+        return
+
+    match = parse_match(text)
+
+    if not match:
         await update.message.reply_text(
-            "Usage:\n/analyze Chelsea vs Arsenal"
+            "â½ Give me a match like:\n"
+            "Chelsea vs Arsenal\n\n"
+            "Examples:\n"
+            "â¢ Analyze Chelsea vs Arsenal\n"
+            "â¢ Pick Chelsea vs Arsenal\n"
+            "â¢ Chelsea vs Arsenal Over 2.5"
         )
         return
 
-    text = " ".join(context.args)
-    home, away = extract_matchup(text)
+    result, error = await asyncio.to_thread(
+        analyze_match, match[0], match[1]
+    )
 
-    if not home or not away:
-        await update.message.reply_text(
-            "Please use:\n/analyze Team A vs Team B"
+    if error:
+        await update.message.reply_text(f"â {error}")
+        return
+
+    market = requested_market(text)
+
+    if market:
+        selected = next(
+            (item for item in result["markets"] if item["market"] == market),
+            None,
         )
-        return
 
-    result = await analyze_match(home, away)
-    await update.message.reply_text(result)
-
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-
-    # SportyBet booking-code flow.
-    code = extract_code(text)
-    sporty_words = (
-        "sportybet", "booking code", "code", "odds", "matches",
-        "selections", "pick", "select", "analyze", "analyse"
-    )
-
-    if code and any(word in text.lower() for word in sporty_words):
-        await handle_code_request(update, text, code)
-        return
-
-    # Natural-language match analysis.
-    low = text.lower()
-    if any(word in low for word in ("analyze", "analyse", "check", "review", "study")):
-        home, away = extract_matchup(text)
-        if home and away:
-            result = await analyze_match(home, away)
-            await update.message.reply_text(result)
+        if selected:
+            await update.message.reply_text(
+                f"ð¯ {market}\n\n"
+                f"ðï¸ {result['home']['name']} vs {result['away']['name']}\n"
+                f"Confidence: {selected['confidence']:.0f}%\n"
+                f"{selected['risk']}\n"
+                f"Advice: {selected['advice']}\n\n"
+                "â ï¸ Statistical guidance only."
+            )
             return
 
-    if "vs" in low or " v " in low:
-        home, away = extract_matchup(text)
-        if home and away and any(
-            word in low for word in ("pick", "select", "choose")
-        ):
-            result = await analyze_match(home, away)
-            await update.message.reply_text(result)
-            return
-
-    await update.message.reply_text(
-        "â½ I didn't understand that request.\n\n"
-        "Try:\n"
-        "â¢ Analyze Chelsea vs Arsenal\n"
-        "â¢ Analyze this SportyBet code ABC123\n"
-        "â¢ Pick the best 5 matches\n"
-        "â¢ Pick the best 5 odds\n"
-        "â¢ Pick 5 matches around 10 odds"
-    )
+    await update.message.reply_text(format_analysis(result))
 
 
-# ============================================================
+# ------------------------------------------------------------
 # MAIN
-# ============================================================
+# ------------------------------------------------------------
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_BOT_TOKEN is missing. Add it to Render Environment Variables."
-        )
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is missing.")
 
     threading.Thread(
         target=start_health_server,
         daemon=True,
     ).start()
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    print(f"Touchline Tipster v{VERSION} running on port {PORT}")
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("version", version_command))
-    application.add_handler(CommandHandler("apitest", apitest_command))
-    application.add_handler(CommandHandler("analyze", analyze_command))
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("team", team_command))
+    app.add_handler(CommandHandler("fixtures", fixtures_command))
+    app.add_handler(CommandHandler("analyze", analyze_command))
+    app.add_handler(CommandHandler("pick", pick_command))
+    app.add_handler(CommandHandler("markets", markets_command))
+    app.add_handler(CommandHandler("h2h", h2h_command))
+    app.add_handler(CommandHandler("code", code_command))
+    app.add_handler(CommandHandler("apitest", apitest_command))
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            natural_language,
+        )
     )
 
-    print(f"Touchline Tipster v{VERSION} starting Telegram polling...")
-    application.run_polling(drop_pending_updates=True)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
