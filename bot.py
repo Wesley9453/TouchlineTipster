@@ -1,5 +1,6 @@
 import os
 import asyncio
+import math
 import threading
 from statistics import mean
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -15,7 +16,7 @@ from telegram.ext import (
 )
 
 # ============================================================
-# TOUCHLINE TIPSTER v4.1
+# TOUCHLINE TIPSTER v4.2
 # ============================================================
 # Core Telegram/backend baseline for the Touchline Tipster app.
 #
@@ -45,7 +46,7 @@ FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"Touchline Tipster v4.1 is running."
+        body = b"Touchline Tipster v4.2 is running."
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -286,6 +287,68 @@ def form_string(fixtures, team_id):
     return "".join(form)
 
 
+def poisson_probability(lam, k):
+    lam = max(0.01, float(lam))
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+
+def seven_outcomes(home, away):
+    # Estimate expected goals from each team's scoring rate and opponent's
+    # conceding rate, then derive the seven core outcome probabilities.
+    home_xg = max(0.10, (home["avg_scored"] + away["avg_conceded"]) / 2)
+    away_xg = max(0.10, (away["avg_scored"] + home["avg_conceded"]) / 2)
+
+    matrix = {}
+    home_win = draw = away_win = over25 = under25 = btts_yes = 0.0
+    for hg in range(0, 9):
+        for ag in range(0, 9):
+            p = poisson_probability(home_xg, hg) * poisson_probability(away_xg, ag)
+            matrix[(hg, ag)] = p
+            if hg > ag:
+                home_win += p
+            elif hg == ag:
+                draw += p
+            else:
+                away_win += p
+            if hg + ag >= 3:
+                over25 += p
+            else:
+                under25 += p
+            if hg > 0 and ag > 0:
+                btts_yes += p
+
+    outcomes = [
+        ("Home Win", home_win * 100),
+        ("Draw", draw * 100),
+        ("Away Win", away_win * 100),
+        ("Over 2.5 Goals", over25 * 100),
+        ("Under 2.5 Goals", under25 * 100),
+        ("Both Teams To Score â Yes", btts_yes * 100),
+        ("Both Teams To Score â No", (1 - btts_yes) * 100),
+    ]
+
+    scores = sorted(
+        ((score, probability * 100) for score, probability in matrix.items()),
+        key=lambda x: x[1],
+        reverse=True,
+    )[:5]
+
+    return {
+        "home_xg": home_xg,
+        "away_xg": away_xg,
+        "outcomes": [
+            {"market": name, "confidence": max(1, min(97, prob)),
+             "risk": risk(max(1, min(97, prob))),
+             "advice": advice(max(1, min(97, prob)))}
+            for name, prob in outcomes
+        ],
+        "scores": [
+            {"score": f"{hg}-{ag}", "probability": prob}
+            for (hg, ag), prob in scores
+        ],
+    }
+
+
 # ------------------------------------------------------------
 # MARKET ENGINE
 # ------------------------------------------------------------
@@ -423,6 +486,7 @@ def analyze_match(home_name, away_name):
         "away_form": form_string(away_fixtures, away_id),
         "h2h": h2h,
         "markets": rank_markets(home_stats, away_stats),
+        "seven_outcomes": seven_outcomes(home_stats, away_stats),
     }, None
 
 
@@ -537,9 +601,34 @@ def format_analysis(result):
         f"BTTS: {result['away_venue']['btts']:.0f}%",
         "",
         "ââââââââââââââââââââ",
-        "ð¯ MARKET RANKING",
+        "ð¯ SEVEN CORE OUTCOMES",
         "ââââââââââââââââââââ",
     ]
+
+    for i, item in enumerate(result["seven_outcomes"]["outcomes"], 1):
+        lines.append(
+            f"{i}. {item['market']} â "
+            f"{item['confidence']:.0f}% {item['risk']} â {item['advice']}"
+        )
+
+    lines.extend([
+        "",
+        "ð¯ POSSIBLE CORRECT SCORES",
+    ])
+
+    for item in result["seven_outcomes"]["scores"]:
+        score_conf = item["probability"]
+        lines.append(
+            f"â¢ {item['score']} â {score_conf:.1f}% "
+            f"{risk(score_conf)}"
+        )
+
+    lines.extend([
+        "",
+        "ââââââââââââââââââââ",
+        "ð¯ MARKET RANKING",
+        "ââââââââââââââââââââ",
+    ])
 
     for i, item in enumerate(result["markets"], 1):
         lines.append(
@@ -817,14 +906,6 @@ async def natural_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     match = parse_match(text)
 
     if not match:
-        await update.message.reply_text(
-            "â½ Give me a match like:\n"
-            "Chelsea vs Arsenal\n\n"
-            "Examples:\n"
-            "â¢ Analyze Chelsea vs Arsenal\n"
-            "â¢ Pick Chelsea vs Arsenal\n"
-            "â¢ Chelsea vs Arsenal Over 2.5"
-        )
         return
 
     result, error = await asyncio.to_thread(
