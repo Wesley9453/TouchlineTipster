@@ -16,7 +16,7 @@ from telegram.ext import (
 
 # ============================================================
 # TOUCHLINE TIPSTER v4.4
-# Fixed API-key handling for Render
+# Clean output + intelligent senior-team selection
 # ============================================================
 
 VERSION = "4.4"
@@ -34,22 +34,35 @@ PORT = int(os.environ.get("PORT", "10000"))
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
         self.end_headers()
-        self.wfile.write(b"Touchline Tipster v4.4 is running.")
+        self.wfile.write(
+            b"Touchline Tipster v4.4 is running."
+        )
 
     def log_message(self, format, *args):
         pass
 
 
 def start_health_server():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server = HTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
+
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True
+    )
+
     thread.start()
 
 
 # ============================================================
-# FIXED API KEY HANDLING
+# API KEY HANDLING
 # ============================================================
 
 def get_api_key():
@@ -63,6 +76,7 @@ def get_api_key():
 
     Never prints the secret.
     """
+
     key = os.environ.get("FOOTBALL_API_KEY")
 
     if key is None:
@@ -70,11 +84,19 @@ def get_api_key():
 
     key = key.strip()
 
-    if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
+    if (
+        len(key) >= 2
+        and key[0] == key[-1]
+        and key[0] in ("'", '"')
+    ):
         key = key[1:-1].strip()
 
     if key.upper().startswith("FOOTBALL_API_KEY="):
-        key = key.split("=", 1)[1].strip().strip("'\"")
+        key = (
+            key.split("=", 1)[1]
+            .strip()
+            .strip("'\"")
+        )
 
     return key or None
 
@@ -97,13 +119,14 @@ def api_get(endpoint, params=None):
     Central API-Sports request function.
     Returns (data, error).
     """
+
     headers = api_headers()
 
     if headers is None:
         return None, (
             "FOOTBALL_API_KEY is missing.\n\n"
-            "The running Render service cannot see the environment "
-            "variable named FOOTBALL_API_KEY."
+            "The running Render service cannot see the "
+            "environment variable named FOOTBALL_API_KEY."
         )
 
     try:
@@ -113,36 +136,61 @@ def api_get(endpoint, params=None):
             params=params or {},
             timeout=REQUEST_TIMEOUT,
         )
+
     except requests.RequestException as exc:
         return None, f"API connection error: {exc}"
 
     try:
         data = response.json()
+
     except ValueError:
         data = {}
 
     if response.status_code == 403:
-        errors = data.get("errors", {}) if isinstance(data, dict) else {}
+        errors = (
+            data.get("errors", {})
+            if isinstance(data, dict)
+            else {}
+        )
+
         token_error = (
             errors.get("token")
             or errors.get("error")
             or "Access forbidden by API-Sports."
         )
-        return None, f"API HTTP 403: {token_error}"
+
+        return None, (
+            f"API HTTP 403: {token_error}"
+        )
 
     if response.status_code == 401:
-        return None, "API HTTP 401: authentication rejected."
+        return None, (
+            "API HTTP 401: authentication rejected."
+        )
 
     if response.status_code >= 400:
-        errors = data.get("errors", {}) if isinstance(data, dict) else {}
+        errors = (
+            data.get("errors", {})
+            if isinstance(data, dict)
+            else {}
+        )
+
         if errors:
-            return None, f"API HTTP {response.status_code}: {errors}"
-        return None, f"API HTTP {response.status_code}: request failed."
+            return None, (
+                f"API HTTP {response.status_code}: {errors}"
+            )
+
+        return None, (
+            f"API HTTP {response.status_code}: request failed."
+        )
 
     if not isinstance(data, dict):
-        return None, "API returned an invalid response."
+        return None, (
+            "API returned an invalid response."
+        )
 
     errors = data.get("errors", {})
+
     if errors:
         return None, f"API error: {errors}"
 
@@ -157,6 +205,7 @@ def api_status_test():
     """
     Tests API-Sports /status without exposing the API key.
     """
+
     key = get_api_key()
 
     if not key:
@@ -176,7 +225,13 @@ def api_status_test():
         }
 
     response = data.get("response", {})
-    account = response.get("account", {}) if isinstance(response, dict) else {}
+
+    account = (
+        response.get("account", {})
+        if isinstance(response, dict)
+        else {}
+    )
+
     subscription = (
         response.get("subscription", {})
         if isinstance(response, dict)
@@ -204,7 +259,11 @@ def poisson_probability(lam, goals):
     if lam <= 0:
         return 1.0 if goals == 0 else 0.0
 
-    return math.exp(-lam) * (lam ** goals) / math.factorial(goals)
+    return (
+        math.exp(-lam)
+        * (lam ** goals)
+        / math.factorial(goals)
+    )
 
 
 def poisson_distribution(lam, max_goals=10):
@@ -218,7 +277,10 @@ def poisson_distribution(lam, max_goals=10):
     if total == 0:
         return values
 
-    return [value / total for value in values]
+    return [
+        value / total
+        for value in values
+    ]
 
 
 # ============================================================
@@ -250,10 +312,117 @@ def find_team(team_name):
 
 
 # ============================================================
+# INTELLIGENT TEAM SELECTION
+# ============================================================
+
+def team_selection_score(team, query):
+    """
+    Gives the highest priority to the exact senior men's team.
+
+    Example:
+        Chelsea -> Chelsea ID 49
+        Chelsea W -> Chelsea W ID 1853
+
+    This prevents Chelsea W, U21, U19, Berekum Chelsea,
+    etc. from accidentally becoming the default selection.
+    """
+
+    name = team.get("name", "").strip()
+    country = team.get("country", "").strip()
+
+    query_clean = query.strip()
+
+    name_lower = name.lower()
+    query_lower = query_clean.lower()
+
+    score = 0
+
+    # Exact name match is strongest.
+    if name_lower == query_lower:
+        score += 1000
+
+    # Exact case-insensitive name match.
+    if name_lower == query_lower:
+        score += 500
+
+    # Prefer teams whose name starts with the search.
+    if name_lower.startswith(query_lower):
+        score += 100
+
+    # For common senior-team searches, prefer England/major
+    # first-team result over youth/women/reserve teams.
+    youth_terms = [
+        " u18",
+        " u19",
+        " u21",
+        " u23",
+        " u17",
+        " youth",
+        " reserves",
+        " reserve",
+        " ii",
+        " b",
+    ]
+
+    women_terms = [
+        " w",
+        " women",
+        " ladies",
+    ]
+
+    for term in youth_terms:
+        if term in name_lower:
+            score -= 250
+
+    for term in women_terms:
+        if name_lower.endswith(term):
+            score -= 250
+
+    # If the exact name is a normal senior team, strongly prefer it.
+    if name_lower == query_lower:
+        if not any(
+            term in name_lower
+            for term in youth_terms + women_terms
+        ):
+            score += 500
+
+    # Prefer England for searches such as Chelsea/Arsenal
+    # when the API returns a similarly named Ghanaian team.
+    if country.lower() == "england":
+        score += 20
+
+    return score
+
+
+def select_best_team(teams, query):
+    """
+    Returns the best matching team from API results.
+    """
+
+    if not teams:
+        return None
+
+    ranked = sorted(
+        teams,
+        key=lambda team: team_selection_score(
+            team,
+            query
+        ),
+        reverse=True,
+    )
+
+    return ranked[0]
+
+
+# ============================================================
 # FIXTURES
 # ============================================================
 
-def get_team_fixtures(team_id, season=FIXTURE_SEASON, last=None):
+def get_team_fixtures(
+    team_id,
+    season=FIXTURE_SEASON,
+    last=None,
+):
     params = {
         "team": team_id,
         "season": season,
@@ -262,7 +431,10 @@ def get_team_fixtures(team_id, season=FIXTURE_SEASON, last=None):
     if last:
         params["last"] = last
 
-    data, error = api_get("/fixtures", params)
+    data, error = api_get(
+        "/fixtures",
+        params
+    )
 
     if error:
         return [], error
@@ -306,6 +478,7 @@ def normalize_fixture(fixture, team_id):
         gf = goals.get("home")
         ga = goals.get("away")
         venue = "HOME"
+
     else:
         gf = goals.get("away")
         ga = goals.get("home")
@@ -319,13 +492,19 @@ def normalize_fixture(fixture, team_id):
 
     if gf > ga:
         result = "W"
+
     elif gf == ga:
         result = "D"
+
     else:
         result = "L"
 
     return {
-        "date": fixture.get("fixture", {}).get("date", ""),
+        "date": fixture.get(
+            "fixture",
+            {}
+        ).get("date", ""),
+
         "venue": venue,
         "gf": gf,
         "ga": ga,
@@ -337,11 +516,18 @@ def normalize_fixture(fixture, team_id):
     }
 
 
-def collect_matches(team_id, fixtures, venue=None):
+def collect_matches(
+    team_id,
+    fixtures,
+    venue=None,
+):
     matches = []
 
     for fixture in fixtures:
-        match = normalize_fixture(fixture, team_id)
+        match = normalize_fixture(
+            fixture,
+            team_id
+        )
 
         if match is None:
             continue
@@ -380,12 +566,30 @@ def calculate_stats(matches):
             "form": "",
         }
 
-    wins = sum(m["result"] == "W" for m in matches)
-    draws = sum(m["result"] == "D" for m in matches)
-    losses = sum(m["result"] == "L" for m in matches)
+    wins = sum(
+        m["result"] == "W"
+        for m in matches
+    )
 
-    gf = sum(m["gf"] for m in matches)
-    ga = sum(m["ga"] for m in matches)
+    draws = sum(
+        m["result"] == "D"
+        for m in matches
+    )
+
+    losses = sum(
+        m["result"] == "L"
+        for m in matches
+    )
+
+    gf = sum(
+        m["gf"]
+        for m in matches
+    )
+
+    ga = sum(
+        m["ga"]
+        for m in matches
+    )
 
     total = len(matches)
 
@@ -398,10 +602,38 @@ def calculate_stats(matches):
         "ga": ga,
         "avg_gf": gf / total,
         "avg_ga": ga / total,
-        "over25": 100 * sum(m["over25"] for m in matches) / total,
-        "btts": 100 * sum(m["btts"] for m in matches) / total,
-        "clean_sheet": 100 * sum(m["clean_sheet"] for m in matches) / total,
-        "form": "".join(m["result"] for m in matches),
+
+        "over25": (
+            100
+            * sum(
+                m["over25"]
+                for m in matches
+            )
+            / total
+        ),
+
+        "btts": (
+            100
+            * sum(
+                m["btts"]
+                for m in matches
+            )
+            / total
+        ),
+
+        "clean_sheet": (
+            100
+            * sum(
+                m["clean_sheet"]
+                for m in matches
+            )
+            / total
+        ),
+
+        "form": "".join(
+            m["result"]
+            for m in matches
+        ),
     }
 
 
@@ -415,15 +647,39 @@ def get_team_analysis(team_id):
     if error:
         return None, error
 
-    all_matches = collect_matches(team_id, fixtures)
-    home_matches = collect_matches(team_id, fixtures, "HOME")
-    away_matches = collect_matches(team_id, fixtures, "AWAY")
+    all_matches = collect_matches(
+        team_id,
+        fixtures
+    )
+
+    home_matches = collect_matches(
+        team_id,
+        fixtures,
+        "HOME"
+    )
+
+    away_matches = collect_matches(
+        team_id,
+        fixtures,
+        "AWAY"
+    )
 
     return {
-        "last5": calculate_stats(all_matches[:5]),
-        "last10": calculate_stats(all_matches[:10]),
-        "home": calculate_stats(home_matches[:5]),
-        "away": calculate_stats(away_matches[:5]),
+        "last5": calculate_stats(
+            all_matches[:5]
+        ),
+
+        "last10": calculate_stats(
+            all_matches[:10]
+        ),
+
+        "home": calculate_stats(
+            home_matches[:5]
+        ),
+
+        "away": calculate_stats(
+            away_matches[:5]
+        ),
     }, None
 
 
@@ -431,22 +687,34 @@ def get_team_analysis(team_id):
 # MATHEMATICAL MODEL
 # ============================================================
 
-def calculate_xg(home_analysis, away_analysis):
+def calculate_xg(
+    home_analysis,
+    away_analysis,
+):
     home = home_analysis["home"]
     away = away_analysis["away"]
 
-    home_xg = (home["avg_gf"] + away["avg_ga"]) / 2
-    away_xg = (away["avg_gf"] + home["avg_ga"]) / 2
+    home_xg = (
+        home["avg_gf"]
+        + away["avg_ga"]
+    ) / 2
+
+    away_xg = (
+        away["avg_gf"]
+        + home["avg_ga"]
+    ) / 2
 
     # Blend venue statistics with recent overall scoring.
     home_xg = (
         0.70 * home_xg
-        + 0.30 * home_analysis["last5"]["avg_gf"]
+        + 0.30
+        * home_analysis["last5"]["avg_gf"]
     )
 
     away_xg = (
         0.70 * away_xg
-        + 0.30 * away_analysis["last5"]["avg_gf"]
+        + 0.30
+        * away_analysis["last5"]["avg_gf"]
     )
 
     return (
@@ -455,9 +723,17 @@ def calculate_xg(home_analysis, away_analysis):
     )
 
 
-def calculate_probabilities(home_xg, away_xg):
-    home_dist = poisson_distribution(home_xg)
-    away_dist = poisson_distribution(away_xg)
+def calculate_probabilities(
+    home_xg,
+    away_xg,
+):
+    home_dist = poisson_distribution(
+        home_xg
+    )
+
+    away_dist = poisson_distribution(
+        away_xg
+    )
 
     home_win = 0
     draw = 0
@@ -473,17 +749,32 @@ def calculate_probabilities(home_xg, away_xg):
 
     scorelines = {}
 
-    for home_goals, home_probability in enumerate(home_dist):
-        for away_goals, away_probability in enumerate(away_dist):
-            probability = home_probability * away_probability
-            total_goals = home_goals + away_goals
+    for home_goals, home_probability in enumerate(
+        home_dist
+    ):
+        for away_goals, away_probability in enumerate(
+            away_dist
+        ):
+            probability = (
+                home_probability
+                * away_probability
+            )
 
-            scorelines[(home_goals, away_goals)] = probability
+            total_goals = (
+                home_goals
+                + away_goals
+            )
+
+            scorelines[
+                (home_goals, away_goals)
+            ] = probability
 
             if home_goals > away_goals:
                 home_win += probability
+
             elif home_goals == away_goals:
                 draw += probability
+
             else:
                 away_win += probability
 
@@ -499,7 +790,10 @@ def calculate_probabilities(home_xg, away_xg):
             if total_goals <= 4:
                 under45 += probability
 
-            if home_goals > 0 and away_goals > 0:
+            if (
+                home_goals > 0
+                and away_goals > 0
+            ):
                 btts += probability
 
             if home_goals > 0:
@@ -512,15 +806,24 @@ def calculate_probabilities(home_xg, away_xg):
         "home_win": home_win * 100,
         "draw": draw * 100,
         "away_win": away_win * 100,
-        "1x": (home_win + draw) * 100,
-        "x2": (draw + away_win) * 100,
+
+        "1x": (
+            home_win + draw
+        ) * 100,
+
+        "x2": (
+            draw + away_win
+        ) * 100,
+
         "over15": over15 * 100,
         "over25": over25 * 100,
         "over35": over35 * 100,
         "under45": under45 * 100,
         "btts": btts * 100,
+
         "home_score": home_score * 100,
         "away_score": away_score * 100,
+
         "scorelines": scorelines,
     }
 
@@ -529,25 +832,35 @@ def calculate_probabilities(home_xg, away_xg):
 # CONFIDENCE / RISK
 # ============================================================
 
-def confidence(probability, consistency=70):
+def confidence(
+    probability,
+    consistency=70,
+):
     value = (
         probability * 0.75
         + consistency * 0.15
         + 100 * 0.10
     )
 
-    return round(clamp(value, 0, 100))
+    return round(
+        clamp(value, 0, 100)
+    )
 
 
 def risk_label(conf):
     if conf >= 75:
-        return "ð¢ GREEN â Strong"
+        return "GREEN - Strong"
+
     if conf >= 60:
-        return "ð¡ YELLOW â Moderate"
-    return "ð´ RED â High Risk"
+        return "YELLOW - Moderate"
+
+    return "RED - High Risk"
 
 
-def consistency_score(home_stats, away_stats):
+def consistency_score(
+    home_stats,
+    away_stats,
+):
     values = [
         home_stats["over25"],
         away_stats["over25"],
@@ -555,9 +868,16 @@ def consistency_score(home_stats, away_stats):
         away_stats["btts"],
     ]
 
-    spread = max(values) - min(values)
+    spread = (
+        max(values)
+        - min(values)
+    )
 
-    return clamp(100 - spread * 0.7, 40, 95)
+    return clamp(
+        100 - spread * 0.7,
+        40,
+        95
+    )
 
 
 def build_markets(
@@ -573,28 +893,81 @@ def build_markets(
     )
 
     raw = [
-        (f"{home_name} or Draw (1X)", probabilities["1x"]),
-        (f"{away_name} or Draw (X2)", probabilities["x2"]),
-        ("Over 1.5 Goals", probabilities["over15"]),
-        ("Under 4.5 Goals", probabilities["under45"]),
-        ("Both Teams To Score", probabilities["btts"]),
-        (f"{home_name} To Score", probabilities["home_score"]),
-        (f"{away_name} To Score", probabilities["away_score"]),
-        (f"{home_name} Win", probabilities["home_win"]),
-        ("Draw", probabilities["draw"]),
-        (f"{away_name} Win", probabilities["away_win"]),
-        ("Over 2.5 Goals", probabilities["over25"]),
-        ("Over 3.5 Goals", probabilities["over35"]),
+        (
+            f"{home_name} or Draw (1X)",
+            probabilities["1x"]
+        ),
+
+        (
+            f"{away_name} or Draw (X2)",
+            probabilities["x2"]
+        ),
+
+        (
+            "Over 1.5 Goals",
+            probabilities["over15"]
+        ),
+
+        (
+            "Under 4.5 Goals",
+            probabilities["under45"]
+        ),
+
+        (
+            "Both Teams To Score",
+            probabilities["btts"]
+        ),
+
+        (
+            f"{home_name} To Score",
+            probabilities["home_score"]
+        ),
+
+        (
+            f"{away_name} To Score",
+            probabilities["away_score"]
+        ),
+
+        (
+            f"{home_name} Win",
+            probabilities["home_win"]
+        ),
+
+        (
+            "Draw",
+            probabilities["draw"]
+        ),
+
+        (
+            f"{away_name} Win",
+            probabilities["away_win"]
+        ),
+
+        (
+            "Over 2.5 Goals",
+            probabilities["over25"]
+        ),
+
+        (
+            "Over 3.5 Goals",
+            probabilities["over35"]
+        ),
     ]
 
     markets = []
 
     for market, probability in raw:
-        conf = confidence(probability, consistency)
+        conf = confidence(
+            probability,
+            consistency
+        )
 
         markets.append({
             "market": market,
-            "probability": round(probability, 1),
+            "probability": round(
+                probability,
+                1
+            ),
             "confidence": conf,
             "risk": risk_label(conf),
         })
@@ -621,8 +994,11 @@ def parse_match(text):
         flags=re.IGNORECASE,
     )
 
-    # Remove common market suffixes when user asks:
+    # Remove common market suffixes.
+    #
+    # Example:
     # Chelsea vs Arsenal Over 2.5
+    #
     text = re.sub(
         r"\s+(over|under)\s+\d+(?:\.\d+)?\s*$",
         "",
@@ -664,17 +1040,25 @@ def parse_match(text):
 # FORMATTING
 # ============================================================
 
-def format_stats(title, stats):
+def format_stats(
+    title,
+    stats,
+):
     return (
         f"{title}\n"
         f"Form: {stats['form'] or 'N/A'} | "
-        f"W/D/L: {stats['wins']}/{stats['draws']}/{stats['losses']}\n"
-        f"GF: {stats['gf']} | GA: {stats['ga']} | "
+        f"W/D/L: "
+        f"{stats['wins']}/"
+        f"{stats['draws']}/"
+        f"{stats['losses']}\n"
+        f"GF: {stats['gf']} | "
+        f"GA: {stats['ga']} | "
         f"Avg GF: {stats['avg_gf']:.2f} | "
         f"Avg GA: {stats['avg_ga']:.2f}\n"
         f"Over 2.5: {stats['over25']:.0f}% | "
         f"BTTS: {stats['btts']:.0f}% | "
-        f"Clean sheets: {stats['clean_sheet']:.0f}%"
+        f"Clean sheets: "
+        f"{stats['clean_sheet']:.0f}%"
     )
 
 
@@ -699,64 +1083,105 @@ def format_analysis(
     )[:3]
 
     lines = [
-        f"â½ TOUCHLINE TIPSTER v{VERSION}",
+        f"TOUCHLINE TIPSTER v{VERSION}",
         "",
-        f"ðï¸ {home_name} vs {away_name}",
+        f"{home_name} vs {away_name}",
         f"Season: {FIXTURE_SEASON}",
         f"Sample: Last {SAMPLE_SIZE} available matches",
         "",
+
         format_stats(
-            f"ð  {home_name} â Recent",
+            f"{home_name} - Recent",
             home_analysis["last5"],
         ),
+
         "",
+
         format_stats(
-            f"ð  {home_name} â Home",
+            f"{home_name} - Home",
             home_analysis["home"],
         ),
+
         "",
+
         format_stats(
-            f"âï¸ {away_name} â Recent",
+            f"{away_name} - Recent",
             away_analysis["last5"],
         ),
+
         "",
+
         format_stats(
-            f"âï¸ {away_name} â Away",
+            f"{away_name} - Away",
             away_analysis["away"],
         ),
+
         "",
-        "ð§® MATHEMATICAL MODEL",
-        f"Expected goals: {home_name} {home_xg:.2f} "
-        f"â {away_name} {away_xg:.2f}",
+
+        "MATHEMATICAL MODEL",
+
+        f"Expected goals: "
+        f"{home_name} {home_xg:.2f} "
+        f"- "
+        f"{away_name} {away_xg:.2f}",
+
         "",
-        "ð MODEL PROBABILITIES",
-        f"{home_name} Win: {probabilities['home_win']:.1f}%",
-        f"Draw: {probabilities['draw']:.1f}%",
-        f"{away_name} Win: {probabilities['away_win']:.1f}%",
-        f"1X: {probabilities['1x']:.1f}%",
-        f"X2: {probabilities['x2']:.1f}%",
-        f"Over 1.5: {probabilities['over15']:.1f}%",
-        f"Over 2.5: {probabilities['over25']:.1f}%",
-        f"Over 3.5: {probabilities['over35']:.1f}%",
-        f"Under 4.5: {probabilities['under45']:.1f}%",
-        f"BTTS: {probabilities['btts']:.1f}%",
+
+        "MODEL PROBABILITIES",
+
+        f"{home_name} Win: "
+        f"{probabilities['home_win']:.1f}%",
+
+        f"Draw: "
+        f"{probabilities['draw']:.1f}%",
+
+        f"{away_name} Win: "
+        f"{probabilities['away_win']:.1f}%",
+
+        f"1X: "
+        f"{probabilities['1x']:.1f}%",
+
+        f"X2: "
+        f"{probabilities['x2']:.1f}%",
+
+        f"Over 1.5: "
+        f"{probabilities['over15']:.1f}%",
+
+        f"Over 2.5: "
+        f"{probabilities['over25']:.1f}%",
+
+        f"Over 3.5: "
+        f"{probabilities['over35']:.1f}%",
+
+        f"Under 4.5: "
+        f"{probabilities['under45']:.1f}%",
+
+        f"BTTS: "
+        f"{probabilities['btts']:.1f}%",
+
         "",
-        "ð¯ TOP BETTING OPTIONS",
+
+        "TOP BETTING OPTIONS",
     ]
 
     for item in markets[:6]:
         lines.append(
-            f"{item['risk']} | {item['market']} | "
+            f"{item['risk']} | "
+            f"{item['market']} | "
             f"Model: {item['probability']:.1f}% | "
-            f"Confidence: {item['confidence']}%"
+            f"Confidence: "
+            f"{item['confidence']}%"
         )
 
     lines.extend([
         "",
-        "ð¯ TOP SCORELINES",
+        "TOP SCORELINES",
     ])
 
-    for (home_goals, away_goals), probability in top_scores:
+    for (
+        (home_goals, away_goals),
+        probability
+    ) in top_scores:
         lines.append(
             f"{home_goals}-{away_goals}: "
             f"{probability * 100:.1f}%"
@@ -764,9 +1189,9 @@ def format_analysis(
 
     lines.extend([
         "",
-        f"ð¤ H2H records found: {len(h2h)}",
+        f"H2H records found: {len(h2h)}",
         "",
-        "â ï¸ Confidence is model-based, not a guarantee.",
+        "Confidence is model-based, not a guarantee.",
         "Odds are not treated as probability.",
     ])
 
@@ -777,7 +1202,7 @@ def format_analysis(
 # TELEGRAM COMMANDS
 # ============================================================
 
-WELCOME = f"""â½ Welcome to Touchline Tipster v{VERSION}
+WELCOME = f"""Welcome to Touchline Tipster v{VERSION}
 
 Deep football statistics, mathematical modelling,
 confidence/risk scoring and betting-market analysis.
@@ -796,12 +1221,22 @@ Chelsea vs Arsenal
 """
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME)
+async def start_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        WELCOME
+    )
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(WELCOME)
+async def help_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await update.message.reply_text(
+        WELCOME
+    )
 
 
 async def apitest_command(
@@ -812,11 +1247,12 @@ async def apitest_command(
 
     if not result["key_found"]:
         await update.message.reply_text(
-            "â Football API connection failed.\n\n"
+            "Football API connection failed.\n\n"
             "FOOTBALL_API_KEY is missing.\n\n"
-            "The running Render service cannot see the variable.\n\n"
+            "The running Render service cannot see "
+            "the variable.\n\n"
             "Go to:\n"
-            "Render â Your Service â Environment\n\n"
+            "Render -> Your Service -> Environment\n\n"
             "Make sure the variable is exactly:\n"
             "FOOTBALL_API_KEY\n\n"
             "Then save/redeploy."
@@ -825,21 +1261,31 @@ async def apitest_command(
 
     if not result["ok"]:
         await update.message.reply_text(
-            "â Football API connection failed.\n\n"
+            "Football API connection failed.\n\n"
             f"{result['message']}\n\n"
             "Environment variable: FOUND\n"
             "API key value: HIDDEN\n"
         )
         return
 
-    subscription = result.get("subscription", {})
+    subscription = result.get(
+        "subscription",
+        {}
+    )
+
     plan = ""
 
-    if isinstance(subscription, dict):
-        plan = subscription.get("plan", "")
+    if isinstance(
+        subscription,
+        dict
+    ):
+        plan = subscription.get(
+            "plan",
+            ""
+        )
 
     message = (
-        "â Football API connection works.\n\n"
+        "Football API connection works.\n\n"
         "Environment variable: FOUND\n"
         "Authentication: ACCEPTED\n"
         "API endpoint: /status\n"
@@ -848,7 +1294,9 @@ async def apitest_command(
     if plan:
         message += f"Plan: {plan}\n"
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(
+        message
+    )
 
 
 async def team_command(
@@ -861,13 +1309,17 @@ async def team_command(
         )
         return
 
-    query = " ".join(context.args)
+    query = " ".join(
+        context.args
+    )
 
-    teams, error = find_team(query)
+    teams, error = find_team(
+        query
+    )
 
     if error:
         await update.message.reply_text(
-            f"â {error}"
+            f"Error: {error}"
         )
         return
 
@@ -878,13 +1330,14 @@ async def team_command(
         return
 
     lines = [
-        f"ð Team results for: {query}",
+        f"Team results for: {query}",
         "",
     ]
 
     for team in teams[:10]:
         lines.append(
-            f"{team['name']} â ID {team['id']} "
+            f"{team['name']} - "
+            f"ID {team['id']} "
             f"({team['country']})"
         )
 
@@ -903,13 +1356,17 @@ async def fixtures_command(
         )
         return
 
-    query = " ".join(context.args)
+    query = " ".join(
+        context.args
+    )
 
-    teams, error = find_team(query)
+    teams, error = find_team(
+        query
+    )
 
     if error:
         await update.message.reply_text(
-            f"â {error}"
+            f"Error: {error}"
         )
         return
 
@@ -919,7 +1376,11 @@ async def fixtures_command(
         )
         return
 
-    team = teams[0]
+    # Automatically select the best senior-team match.
+    team = select_best_team(
+        teams,
+        query
+    )
 
     fixtures, error = get_team_fixtures(
         team["id"],
@@ -928,43 +1389,58 @@ async def fixtures_command(
 
     if error:
         await update.message.reply_text(
-            f"â {error}"
+            f"Error: {error}"
         )
         return
 
     if not fixtures:
         await update.message.reply_text(
-            f"No fixtures found for {team['name']} "
-            f"in season {FIXTURE_SEASON}."
+            f"No fixtures found for "
+            f"{team['name']} in season "
+            f"{FIXTURE_SEASON}."
         )
         return
 
     lines = [
-        f"â½ {team['name']} fixtures",
+        f"{team['name']} fixtures",
+        f"Team ID: {team['id']}",
         f"Season: {FIXTURE_SEASON}",
         "",
     ]
 
     for fixture in fixtures[:10]:
-        fixture_teams = fixture.get("teams", {})
+        fixture_teams = fixture.get(
+            "teams",
+            {}
+        )
 
         home = fixture_teams.get(
             "home",
-            {},
-        ).get("name", "?")
+            {}
+        ).get(
+            "name",
+            "?"
+        )
 
         away = fixture_teams.get(
             "away",
-            {},
-        ).get("name", "?")
+            {}
+        ).get(
+            "name",
+            "?"
+        )
 
         date = fixture.get(
             "fixture",
-            {},
-        ).get("date", "?")
+            {}
+        ).get(
+            "date",
+            "?"
+        )
 
         lines.append(
-            f"{date[:10]} â {home} vs {away}"
+            f"{date[:10]} - "
+            f"{home} vs {away}"
         )
 
     await update.message.reply_text(
@@ -972,56 +1448,75 @@ async def fixtures_command(
     )
 
 
+# ============================================================
+# MATCH ANALYSIS
+# ============================================================
+
 async def run_match_analysis(
     update: Update,
     text: str,
 ):
-    home_query, away_query = parse_match(text)
+    home_query, away_query = parse_match(
+        text
+    )
 
     if not home_query or not away_query:
         await update.message.reply_text(
             "Give me a match like: Chelsea vs Arsenal\n\n"
             "Examples:\n"
-            "â¢ Analyze Chelsea vs Arsenal\n"
-            "â¢ Pick Chelsea vs Arsenal\n"
-            "â¢ Chelsea vs Arsenal Over 2.5"
+            "Analyze Chelsea vs Arsenal\n"
+            "Pick Chelsea vs Arsenal\n"
+            "Chelsea vs Arsenal Over 2.5"
         )
         return
 
     await update.message.reply_text(
-        f"ð Analyzing {home_query} vs {away_query}..."
+        f"Analyzing {home_query} vs "
+        f"{away_query}..."
     )
 
-    home_teams, error = find_team(home_query)
+    home_teams, error = find_team(
+        home_query
+    )
 
     if error:
         await update.message.reply_text(
-            f"â {error}"
+            f"Error: {error}"
         )
         return
 
-    away_teams, error = find_team(away_query)
+    away_teams, error = find_team(
+        away_query
+    )
 
     if error:
         await update.message.reply_text(
-            f"â {error}"
+            f"Error: {error}"
         )
         return
 
     if not home_teams:
         await update.message.reply_text(
-            f"â Could not find: {home_query}"
+            f"Could not find: {home_query}"
         )
         return
 
     if not away_teams:
         await update.message.reply_text(
-            f"â Could not find: {away_query}"
+            f"Could not find: {away_query}"
         )
         return
 
-    home = home_teams[0]
-    away = away_teams[0]
+    # Intelligent senior-team selection.
+    home = select_best_team(
+        home_teams,
+        home_query
+    )
+
+    away = select_best_team(
+        away_teams,
+        away_query
+    )
 
     home_analysis, error = get_team_analysis(
         home["id"]
@@ -1029,7 +1524,7 @@ async def run_match_analysis(
 
     if error:
         await update.message.reply_text(
-            f"â {error}"
+            f"Error: {error}"
         )
         return
 
@@ -1039,7 +1534,7 @@ async def run_match_analysis(
 
     if error:
         await update.message.reply_text(
-            f"â {error}"
+            f"Error: {error}"
         )
         return
 
@@ -1076,7 +1571,9 @@ async def run_match_analysis(
         markets,
     )
 
-    await update.message.reply_text(message)
+    await update.message.reply_text(
+        message
+    )
 
 
 async def analyze_command(
@@ -1121,10 +1618,21 @@ async def text_message(
     text = update.message.text or ""
 
     if (
-        re.search(r"\s+vs\.?\s+", text, flags=re.IGNORECASE)
-        or re.search(r"\s+v\s+", text, flags=re.IGNORECASE)
+        re.search(
+            r"\s+vs\.?\s+",
+            text,
+            flags=re.IGNORECASE
+        )
+        or re.search(
+            r"\s+v\s+",
+            text,
+            flags=re.IGNORECASE
+        )
     ):
-        await run_match_analysis(update, text)
+        await run_match_analysis(
+            update,
+            text
+        )
 
 
 # ============================================================
@@ -1136,7 +1644,7 @@ def main():
 
     telegram_token = os.environ.get(
         "TELEGRAM_BOT_TOKEN",
-        "",
+        ""
     ).strip()
 
     if not telegram_token:
@@ -1151,7 +1659,9 @@ def main():
 
     print(
         "FOOTBALL_API_KEY:",
-        "FOUND" if get_api_key() else "MISSING",
+        "FOUND"
+        if get_api_key()
+        else "MISSING",
     )
 
     application = (
@@ -1161,36 +1671,58 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start_command)
+        CommandHandler(
+            "start",
+            start_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("help", help_command)
+        CommandHandler(
+            "help",
+            help_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("apitest", apitest_command)
+        CommandHandler(
+            "apitest",
+            apitest_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("team", team_command)
+        CommandHandler(
+            "team",
+            team_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("fixtures", fixtures_command)
+        CommandHandler(
+            "fixtures",
+            fixtures_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("analyze", analyze_command)
+        CommandHandler(
+            "analyze",
+            analyze_command
+        )
     )
 
     application.add_handler(
-        CommandHandler("pick", pick_command)
+        CommandHandler(
+            "pick",
+            pick_command
+        )
     )
 
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.TEXT
+            & ~filters.COMMAND,
             text_message,
         )
     )
